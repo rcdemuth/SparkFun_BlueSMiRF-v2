@@ -98,7 +98,7 @@ jobs:
           source_file: ./Firmware/BlueSMiRF-v2/build/esp32.esp32.esp32/${{ env.FILENAME_PREFIX }}${{ env.FILE_ENDING_UNDERSCORE }}.bin
           destination_repo: 'rcdemuth/SparkFun_BlueSMiRF-v2_Binaries'
           destination_folder: ''
-          user_email: 'nathan@sparkfun.com'
+          user_email: 'demuth@marshall.edu'
           user_name: 'nseidle'
           commit_message: 'Github Action - Updating Binary ${{ steps.dateNoScores.outputs.dateNoScores }}'
 
