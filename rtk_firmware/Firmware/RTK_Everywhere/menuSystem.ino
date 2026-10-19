@@ -1,0 +1,1761 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+menuSystem.ino
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+#ifdef COMPILE_MENU_SYSTEM
+
+// Display current system status
+void menuSystem()
+{
+    BluetoothRadioType_e bluetoothUserChoice = settings.bluetoothRadioType;
+
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("System Status");
+
+        printTimeStamp(true);
+
+        if (present.display_type < DISPLAY_MAX_NONE)
+        {
+            systemPrint("Display: ");
+            if (online.display == true)
+                systemPrintln("Online");
+            else
+                systemPrintln("Offline");
+        }
+
+        if (present.fuelgauge_bq40z50 || present.fuelgauge_max17048)
+        {
+            systemPrint("Fuel Gauge: ");
+            if (online.batteryFuelGauge == true)
+            {
+                systemPrint("Online - ");
+
+                systemPrintf("Batt (%d%%) / Voltage: %0.02fV", batteryLevelPercent, batteryVoltage);
+                systemPrintln();
+            }
+            else
+                systemPrintln("Offline");
+        }
+
+        if (present.microSd)
+        {
+            systemPrint("microSD: ");
+            if (online.microSD == true)
+                systemPrintln("Online");
+            else
+                systemPrintln("Offline");
+        }
+
+        if (present.gnss_mosaicX5 == true)
+        {
+            systemPrint("mosaic-X5 L-Band: ");
+
+            if (online.lband_gnss == true)
+                systemPrintln("Online - ");
+            else
+                systemPrintln("Offline - ");
+
+            if (online.ppl == true)
+                systemPrint("Keys Good");
+            else
+                systemPrint("No Keys");
+
+            systemPrint(" / Corrections Received");
+            if (spartnCorrectionsReceived == false)
+                systemPrint(" Failed");
+
+            // TODO : do we need to enable SBF LBandTrackerStatus so we can get CN0 ?
+        }
+
+        // Display the Bluetooth status
+        bluetoothPrintStatus();
+
+#ifdef COMPILE_NETWORK
+        networkDisplayStatus();
+#endif // COMPILE_NETWORK
+
+        // Display the uptime
+        uint64_t uptimeMilliseconds = millis();
+        uint32_t uptimeDays = 0;
+        byte uptimeHours = 0;
+        byte uptimeMinutes = 0;
+        byte uptimeSeconds = 0;
+
+        uptimeDays = uptimeMilliseconds / MILLISECONDS_IN_A_DAY;
+        uptimeMilliseconds %= MILLISECONDS_IN_A_DAY;
+
+        uptimeHours = uptimeMilliseconds / MILLISECONDS_IN_AN_HOUR;
+        uptimeMilliseconds %= MILLISECONDS_IN_AN_HOUR;
+
+        uptimeMinutes = uptimeMilliseconds / MILLISECONDS_IN_A_MINUTE;
+        uptimeMilliseconds %= MILLISECONDS_IN_A_MINUTE;
+
+        uptimeSeconds = uptimeMilliseconds / MILLISECONDS_IN_A_SECOND;
+        uptimeMilliseconds %= MILLISECONDS_IN_A_SECOND;
+
+        systemPrint("System Uptime: ");
+        systemPrintf("%d %02d:%02d:%02d.%03lld (Resets: %d)\r\n", uptimeDays, uptimeHours, uptimeMinutes, uptimeSeconds,
+                     uptimeMilliseconds, settings.resetCount);
+
+        // Display MQTT Client status and uptime
+        mqttClientPrintStatus();
+
+        // Display NTRIP Client status and uptime
+        ntripClientPrintStatus();
+
+        // Display NTRIP Server status and uptime
+        for (int serverIndex = 0; serverIndex < NTRIP_SERVER_MAX; serverIndex++)
+            ntripServerPrintStatus(serverIndex);
+
+        systemPrintf("Filtered by parser: %d NMEA / %d RTCM / %d UBX\r\n", failedParserMessages_NMEA,
+                     failedParserMessages_RTCM, failedParserMessages_UBX);
+
+        //---------------------------
+        // Start of menu
+        //---------------------------
+
+        systemPrintln();
+        systemPrintln("Menu: System");
+        // Separate the menu from the status
+        systemPrintln("-----  Mode Switch  -----");
+        systemPrintf("Mode: %s\r\n", stateToRtkMode(systemState));
+
+        // Support mode switching
+        systemPrintln("A) Switch to Base mode using Base Assist");
+        systemPrintln("B) Switch to Base mode");
+        systemPrintln("C) Switch to Base Caster mode");
+        if (present.ethernet_ws5500 == true)
+            systemPrintln("N) Switch to NTP Server mode");
+        systemPrintln("R) Switch to Rover mode");
+        systemPrintln("W) Switch to Web Config mode");
+        if (present.fastPowerOff == true)
+            systemPrintln("S) Shut down");
+
+        systemPrintln("-----  Settings  -----");
+
+        systemPrint("a) Automatic device reboot in minutes: ");
+        if (settings.rebootMinutes == 0)
+            systemPrintln("Disabled");
+        else
+        {
+            int days;
+            int hours;
+            int minutes;
+
+            const int minutesInADay = 60 * 24;
+
+            minutes = settings.rebootMinutes;
+            days = minutes / minutesInADay;
+            minutes -= days * minutesInADay;
+            hours = minutes / 60;
+            minutes -= hours * 60;
+
+            systemPrintf("%d (%d days %d:%02d)\r\n", settings.rebootMinutes, days, hours, minutes);
+        }
+
+        mmDisplayBluetoothRadioMenu('b', bluetoothUserChoice);
+
+        if (present.fuelgauge_max17048 || present.fuelgauge_bq40z50 || present.charger_mp2762a)
+        {
+            if (settings.shutdownNoChargeTimeoutMinutes == 0)
+                systemPrintln("c) Shutdown if not charging: Disabled");
+            else
+                systemPrintf("c) Shutdown if not charging after: %d minutes\r\n",
+                             settings.shutdownNoChargeTimeoutMinutes);
+        }
+
+        systemPrintln("d) Debug software");
+
+        systemPrint("e) Echo User Input: ");
+        if (settings.echoUserInput == true)
+            systemPrintln("On");
+        else
+            systemPrintln("Off");
+
+        if (settings.enableSD == true && online.microSD == true)
+        {
+            systemPrintln("f) Display microSD Files");
+        }
+
+        if (present.beeper == true)
+        {
+            systemPrint("g) Enable Beeper: ");
+            systemPrintf("%s\r\n", settings.enableBeeper ? "Enabled" : "Disabled");
+        }
+
+        systemPrintln("h) Debug hardware");
+
+#ifdef COMPILE_MENU_USER_PROFILES
+        systemPrintln("l) Debug LFS and SD card files");
+#endif // COMPILE_MENU_USER_PROFILES
+
+        systemPrintln("n) Debug network");
+
+        systemPrintln("o) Configure operation");
+
+        systemPrintln("p) Configure periodic print messages");
+
+        systemPrintln("r) Reset all settings to default");
+
+        systemPrintf("u) Printed measurement units: %s\r\n",
+                     measurementScaleTable[measurementScaleToIndex(settings.measurementScale)].measurementScaleName);
+
+        systemPrintf("z) Set time zone offset: %02d:%02d:%02d\r\n", settings.timeZoneHours, settings.timeZoneMinutes,
+                     settings.timeZoneSeconds);
+
+        systemPrint("~) Setup button: ");
+        if (settings.disableSetupButton == true)
+            systemPrintln("Disabled");
+        else
+            systemPrintln("Enabled");
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 'a')
+        {
+            // We use millis (uint32_t) to measure the reboot interval. 4294967000 is just less than (2^32 - 1)
+            systemPrint("Enter uptime minutes before reboot, Disabled = 0, Reboot range (1 - 4294967): ");
+            int rebootMinutes = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((rebootMinutes != INPUT_RESPONSE_GETNUMBER_EXIT) && (rebootMinutes != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if (rebootMinutes < 1 || rebootMinutes > 4294967) // Disable the reboot
+                {
+                    settings.rebootMinutes = 0;
+                    systemPrintln("Reset is disabled");
+                }
+                else
+                {
+                    int days;
+                    int hours;
+                    int minutes;
+
+                    const int minutesInADay = 60 * 24;
+
+                    // Set the reboot time
+                    settings.rebootMinutes = rebootMinutes;
+
+                    minutes = settings.rebootMinutes;
+                    days = minutes / minutesInADay;
+                    minutes -= days * minutesInADay;
+                    hours = minutes / 60;
+                    minutes -= hours * 60;
+
+                    systemPrintf("Reboot after uptime reaches %d days %d:%02d\r\n", days, hours, minutes);
+                }
+            }
+        }
+        else if (incoming == 'b')
+            bluetoothUserChoice = mmChangeBluetoothProtocol(bluetoothUserChoice);
+        else if ((incoming == 'c') &&
+                 (present.fuelgauge_max17048 || present.fuelgauge_bq40z50 || present.charger_mp2762a))
+        {
+            getNewSetting("Enter time in minutes to shutdown unit if not charging (0 to disable)", 0, 60 * 24 * 7,
+                          &settings.shutdownNoChargeTimeoutMinutes); // Arbitrary 7 day limit
+        }
+        else if (incoming == 'd')
+            menuDebugSoftware();
+        else if (incoming == 'e')
+        {
+            settings.echoUserInput ^= 1;
+        }
+        else if ((incoming == 'f') && (settings.enableSD == true) && (online.microSD == true))
+        {
+            printFileList();
+        }
+        else if (incoming == 'g' && present.beeper == true)
+        {
+            settings.enableBeeper ^= 1;
+        }
+        else if (incoming == 'h')
+            menuDebugHardware();
+
+#ifdef COMPILE_MENU_USER_PROFILES
+        else if (incoming == 'l')
+            menuDebugFiles();
+#endif // COMPILE_MENU_USER_PROFILES
+
+        else if (incoming == 'n')
+            menuDebugNetwork();
+        else if (incoming == 'o')
+            menuOperation();
+        else if (incoming == 'p')
+            menuPeriodicPrint();
+        else if (incoming == 'r')
+        {
+            systemPrintln("\r\nResetting to factory defaults. Press 'y' to confirm:");
+            byte bContinue = getUserInputCharacterNumber();
+            if (bContinue == 'y')
+            {
+                factoryReset(false); // We do not have the SD semaphore
+            }
+            else
+                systemPrintln("Reset aborted");
+        }
+        else if (incoming == 'u')
+        {
+            settings.measurementScale += 1;
+            if (settings.measurementScale >= MEASUREMENT_UNITS_MAX)
+                settings.measurementScale = 0;
+        }
+        else if (incoming == 'z')
+        {
+            systemPrint("Enter time zone hour offset (-23 <= offset <= 23): ");
+            int value = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((value != INPUT_RESPONSE_GETNUMBER_EXIT) && (value != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if (value < -23 || value > 23)
+                    systemPrintln("Error: -24 < hours < 24");
+                else
+                {
+                    settings.timeZoneHours = value;
+
+                    systemPrint("Enter time zone minute offset (-59 <= offset <= 59): ");
+                    int value = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+                    if ((value != INPUT_RESPONSE_GETNUMBER_EXIT) && (value != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+                    {
+                        if (value < -59 || value > 59)
+                            systemPrintln("Error: -60 < minutes < 60");
+                        else
+                        {
+                            settings.timeZoneMinutes = value;
+
+                            systemPrint("Enter time zone second offset (-59 <= offset <= 59): ");
+                            int value = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+                            if ((value != INPUT_RESPONSE_GETNUMBER_EXIT) && (value != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+                            {
+                                if (value < -59 || value > 59)
+                                    systemPrintln("Error: -60 < seconds < 60");
+                                else
+                                {
+                                    settings.timeZoneSeconds = value;
+                                    online.rtc = false;
+                                    syncRTCInterval =
+                                        1000; // Reset syncRTCInterval to 1000ms (tpISR could have set it to 59000)
+                                    rtcSyncd = false;
+                                    rtcUpdate();
+                                } // Succesful seconds
+                            }
+                        } // Succesful minute
+                    }
+                } // Succesful hours
+            }
+        }
+        else if (incoming == '~')
+        {
+            settings.disableSetupButton ^= 1;
+        }
+
+        // Support mode switching
+        else if (incoming == 'A')
+        {
+            forceSystemStateUpdate = true; // Immediately go to this new state
+            baseCasterDisableOverride();   // Leave Caster mode
+            changeState(STATE_BASE_ASSIST_NOT_STARTED);
+        }
+        else if (incoming == 'B')
+        {
+            forceSystemStateUpdate = true; // Immediately go to this new state
+            baseCasterDisableOverride();   // Leave Caster mode
+            changeState(STATE_BASE_NOT_STARTED);
+        }
+        else if (incoming == 'C')
+        {
+            forceSystemStateUpdate = true; // Immediately go to this new state
+            changeState(STATE_BASE_CASTER_NOT_STARTED);
+        }
+        else if ((incoming == 'N') && (present.ethernet_ws5500 == true))
+        {
+            forceSystemStateUpdate = true; // Immediately go to this new state
+            changeState(STATE_NTPSERVER_NOT_STARTED);
+        }
+        else if (incoming == 'R')
+        {
+            forceSystemStateUpdate = true; // Immediately go to this new state
+            changeState(STATE_ROVER_NOT_STARTED);
+        }
+        else if (incoming == 'W')
+        {
+            forceSystemStateUpdate = true; // Immediately go to this new state
+            changeState(STATE_WEB_CONFIG_NOT_STARTED);
+        }
+        else if (incoming == 'S' && present.fastPowerOff == true)
+        {
+            systemPrintln("Shutting down...");
+            forceDisplayUpdate = true;
+            powerDown(true);
+        }
+
+        // Menu exit control
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    // Update Bluetooth radio if settings have changed (ignore clearBtPairings)
+    bluetoothApplySettings(bluetoothUserChoice, settings.clearBtPairings);
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#ifdef COMPILE_MENU_USER_PROFILES
+
+// Debug LFS and SD card files
+void menuDebugFiles()
+{
+    char fileName[60];
+    bool filePresent;
+    bool gotSemaphore;
+    uint8_t profile = profileNumber;
+    const char *profileNumberFileName = "/profileNumber.txt";
+    bool sdActive = false;
+    bool wasSdCardOnline = false;
+    int x;
+
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Debug NVM and SD card files");
+
+        // Try to gain access the SD card
+        gotSemaphore = false;
+        if (sdActive)
+        {
+            wasSdCardOnline = online.microSD;
+            if (online.microSD == false)
+                beginSD();
+
+            if (online.microSD)
+            {
+                // Attempt to access file system. This avoids collisions with file writing from other functions like
+                // recordSystemSettingsToFile() and gnssSerialReadTask()
+                if (xSemaphoreTake(sdCardSemaphore, fatSemaphore_longWait_ms) == pdPASS)
+                {
+                    gotSemaphore = true;
+                    markSemaphore(FUNCTION_FILE_EXISTS);
+                }
+            }
+        }
+
+        // List available profiles
+        for (x = 0; x < MAX_PROFILE_COUNT; x++)
+        {
+            // Get the file name
+            getProfileFileName(x, fileName, sizeof(fileName));
+
+            // Determine if the file is present
+            filePresent = false;
+            if (sdActive)
+            {
+                if (online.microSD && gotSemaphore)
+                    filePresent = sd->exists(fileName);
+            }
+            else
+                filePresent = LittleFS.exists(fileName);
+            if (filePresent)
+                systemPrintf("%d) Select %s%s%s\r\n",
+                             x, sdActive ? "SD" : "NVM", fileName,
+                             (x == profile) ? " <- Current" : "");
+        }
+
+        // Check for profileNumber.txt
+        strcpy(fileName, profileNumberFileName);
+        filePresent = false;
+        if (sdActive)
+        {
+            if (online.microSD && gotSemaphore)
+                filePresent = sd->exists(fileName);
+        }
+        else
+            filePresent = LittleFS.exists(fileName);
+        if (filePresent)
+            systemPrintf("%d) Dump %s%s\r\n",
+                         x, sdActive ? "SD" : "NVM", fileName);
+        x += 1;
+
+        // *** Start of menu ***
+        // Support file dumping
+        getProfileFileName(profile, fileName, sizeof(fileName));
+        systemPrintf("d) Dump file: %s:%s\r\n",
+                     sdActive ? "SD" : "NVM", fileName);
+
+        // Support directory listings
+        systemPrintf("l) List %s files\r\n", sdActive ? "SD" : "NVM");
+
+        // Toggle between NVM and SD card
+        if (online.microSD)
+            systemPrintf("t) Toggle between NVM and SD\r\n");
+
+        // Verify file CRC
+        systemPrintf("v) Verify %s:%s CRC\r\n",
+                     sdActive ? "SD" : "NVM", fileName);
+
+        // Release access the SD card
+        if (sdActive)
+        {
+            if (online.microSD && (!wasSdCardOnline))
+                endSD(gotSemaphore, true);
+            else if (gotSemaphore)
+                xSemaphoreGive(sdCardSemaphore);
+        }
+
+        // Exit
+        // *** End of menu ***
+        systemPrintln("x) Exit");
+
+        // Get menu choice
+        byte incoming = getUserInputCharacterNumber();
+
+        // Check for a profile number
+        if ((incoming >= 0) && (incoming < MAX_PROFILE_COUNT))
+            profile = incoming;
+
+        // Dump profileNumber.txt
+        if (incoming == MAX_PROFILE_COUNT)
+        {
+            if (sdActive)
+                sdCardDumpFile(profileNumberFileName);
+            else
+                nvmDumpFile(profileNumberFileName);
+        }
+
+        // Dump the file if requested
+        else if (incoming == 'd')
+        {
+            getProfileFileName(profile, fileName, sizeof(fileName));
+            if (sdActive)
+                sdCardDumpFile(fileName);
+            else
+                nvmDumpFile(fileName);
+        }
+
+        // List the files in the file system
+        else if (incoming == 'l')
+        {
+            if (sdActive)
+                sdCardDirectoryListing();
+            else
+                nvmDirectoryListing();
+        }
+
+        // Toggle the selection between NVM and the SD card
+        else if (incoming == 't')
+            sdActive = !sdActive;
+
+        // Verify the file CRC
+        else if (incoming == 'v')
+        {
+            if (sdActive)
+                nvmVerifySdFileCrc(fileName);
+            else
+                nvmVerifyLfsFileCrc(fileName);
+        }
+
+        // All done with this menu
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_EXIT)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#endif // COMPILE_MENU_USER_PROFILES
+
+// Toggle debug settings for hardware
+void menuDebugHardware()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Debug Hardware");
+
+        // Battery
+        systemPrint("1) Print battery status messages: ");
+        systemPrintf("%s\r\n", settings.enablePrintBatteryMessages ? "Enabled" : "Disabled");
+
+        // RTC
+        systemPrint("3) Print RTC resyncs: ");
+        systemPrintf("%s\r\n", settings.enablePrintRtcSync ? "Enabled" : "Disabled");
+
+        // SD card
+        systemPrint("4) Print log file messages: ");
+        systemPrintf("%s\r\n", settings.enablePrintLogFileMessages ? "Enabled" : "Disabled");
+
+        systemPrint("5) Print log file status: ");
+        systemPrintf("%s\r\n", settings.enablePrintLogFileStatus ? "Enabled" : "Disabled");
+
+        systemPrint("7) Print SD and UART buffer sizes: ");
+        systemPrintf("%s\r\n", settings.enablePrintSDBuffers ? "Enabled" : "Disabled");
+
+        // GNSS
+        systemPrint("9) Print GNSS Debugging: ");
+        systemPrintf("%s\r\n", settings.debugGnss ? "Enabled" : "Disabled");
+
+        systemPrint("10) Print Correction Debugging: ");
+        systemPrintf("%s\r\n", settings.debugCorrections ? "Enabled" : "Disabled");
+
+        systemPrint("11) Print Tilt/IMU Debugging: ");
+        systemPrintf("%s\r\n", settings.enableImuDebug ? "Enabled" : "Disabled");
+
+        systemPrint("12) Print Tilt/IMU Compensation Debugging: ");
+        systemPrintf("%s\r\n", settings.enableImuCompensationDebug ? "Enabled" : "Disabled");
+
+        // GNSS Firmware upgrades:
+        // On Torch:    we need a direct connection (passthrough) from USB to CH342 B to
+        //              ESP32 UART0 to ESP32 UART1 to UM980 UART3 for firmware upgrade.
+        // On Postcard: firmware can be updated over USB and the CH342 B connection to GNSS
+        //              UART1. A hardware GNSS reset may be beneficial, but it is possible
+        //              to reset over USB / UART too ($PQTMSRR*4B).
+        // On Facet FP: a direct connection can be created from USB to USB Hub to CH342 A to
+        //              GNSS UART1.
+        //              mosaic-X5 can also be updated over USB via the USB Hub
+        //              ZED-X20P needs the direct connection. Update via USB is not possible.
+        //              LG290P needs the direct connection.
+        //              A future UM980 variant will also need a direct connection.
+        //              Updates via the 4-pin JST RADIO connector and GNSS UART2 may also be possible.
+
+        if (productVariant == RTK_FACET_FP)
+            systemPrintln("13) GNSS direct connect for firmware update");
+        else if (present.gnss_um980)
+            systemPrintln("13) UM980 direct connect for firmware upgrade"); // Torch
+        else if (present.gnss_lg290p)
+            systemPrintln("13) LG290P reset for firmware update"); // Torch X2 / Postcard
+
+        systemPrint("14) PSRAM (");
+        if (ESP.getPsramSize() == 0)
+        {
+            systemPrint("None");
+        }
+        else
+        {
+            if (online.psram == true)
+                systemPrint("online");
+            else
+                systemPrint("offline");
+        }
+        systemPrint("): ");
+        systemPrintf("%s\r\n", settings.enablePsram ? "Enabled" : "Disabled");
+
+        systemPrint("15) Print ESP-NOW Debugging: ");
+        systemPrintf("%s\r\n", settings.debugEspNow ? "Enabled" : "Disabled");
+
+        systemPrint("16) Print LoRa Debugging: ");
+        systemPrintf("%s\r\n", settings.debugLora ? "Enabled" : "Disabled");
+
+        // LoRa Firmware upgrades:
+        // On Torch: we need a direct connection from USB to CH342 B to ESP32 UART0 to
+        //           ESP32 UART1 to LoRa UART0.
+        // On Facet FP:  we need a direct connection from USB to USB Hub to ESP32 UART0 to
+        //           ESP32 UART2 to LoRa UART2.
+
+        if (present.radio_lora)
+            systemPrintln("17) STM32 direct connect for LoRa firmware upgrade");
+
+        systemPrintln("18) Display littleFS stats");
+
+        systemPrint("19) Print CLI Debugging: ");
+        systemPrintf("%s\r\n", settings.debugCLI ? "Enabled" : "Disabled");
+
+        systemPrintf("20) Delay between CLI LIST prints over BLE: %dms\r\n", settings.cliBlePrintDelay_ms);
+
+        systemPrintf("21) Double-Tap Interval: %dms\r\n", settings.defaultDoubleTapInterval_ms);
+
+        systemPrint("22) Print GNSS Config Debugging: ");
+        systemPrintf("%s\r\n", settings.debugGnssConfig ? "Enabled" : "Disabled");
+
+        systemPrintln("23) Reset GNSS Config");
+
+        systemPrintf("24) EA Protocol name: %s\r\n", settings.eaProtocol);
+
+        systemPrintf("25) RTCM buffer debugging: %s\r\n", settings.debugRtcmBuffers ? "Enabled" : "Disabled");
+
+        if (present.radio_lora)
+        {
+            systemPrintln("26) STM32 direct connect for LoRa RX testing");
+            systemPrintln("27) STM32 dedicated LoRa TX testing");
+        }
+        if (present.imu_im19)
+            systemPrintln("28) IM19 direct connect for firmware upgrade"); // Torch / FP
+
+        systemPrintln("c) Display configuration");
+
+        systemPrintln("e) Erase LittleFS");
+
+        systemPrintln("p) Display product resistor table");
+
+        systemPrintln("r) Force system reset");
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+            settings.enablePrintBatteryMessages ^= 1;
+        else if (incoming == 3)
+            settings.enablePrintRtcSync ^= 1;
+        else if (incoming == 4)
+            settings.enablePrintLogFileMessages ^= 1;
+        else if (incoming == 5)
+            settings.enablePrintLogFileStatus ^= 1;
+
+        else if (incoming == 7)
+            settings.enablePrintSDBuffers ^= 1;
+        else if (incoming == 9)
+        {
+            settings.debugGnss ^= 1;
+
+            if (settings.debugGnss)
+                gnss->debuggingEnable();
+            else
+                gnss->debuggingDisable();
+        }
+        else if (incoming == 10)
+        {
+            settings.debugCorrections ^= 1;
+        }
+        else if (incoming == 11)
+        {
+            settings.enableImuDebug ^= 1;
+        }
+        else if (incoming == 12)
+        {
+            settings.enableImuCompensationDebug ^= 1;
+        }
+        else if (incoming == 13)
+        {
+            if (productVariant == RTK_FACET_FP)
+            {
+                // Create a file in LittleFS
+                if (gnssCreatePassthroughFile() == true)
+                {
+                    systemPrintln();
+                    systemPrintln("GNSS passthrough mode has been recorded to LittleFS. Device will now reset.");
+                    systemFlush(); // Complete prints
+
+                    ESP.restart();
+                }
+            }
+            else if (present.gnss_um980)
+            {
+                // Create a file in LittleFS
+                if (um980CreatePassthroughFile() == true)
+                {
+                    systemPrintln();
+                    systemPrintln("UM980 passthrough mode has been recorded to LittleFS. Device will now reset.");
+                    systemFlush(); // Complete prints
+
+                    ESP.restart();
+                }
+            }
+            else if (present.gnss_lg290p)
+            {
+                systemPrintln();
+                systemPrintf("QGNSS must be connected to %s at %dbps.\r\n", present.gnssUpdatePort,
+                             settings.dataPortBaud);
+                systemPrintf("Begin firmware update from QGNSS (hit the play button) "
+                             "then reset the LG290P using menu choice %d.\r\n",
+                             incoming);
+                gpioGnssReset();
+                delay(100);
+                gpioGnssBoot();
+                systemPrintln("LG290P reset complete.");
+                gnssConfigureDefaults(); // Set all bits in the request bitfield to cause the GNSS receiver to go
+                                         // through a full (re)configuration
+                recordSystemSettings();  // Record these settings to unit
+                systemPrintln("GNSS defaults have been applied. GNSS will be configured when you exit the menu.");
+                systemPrintln("Wait for the update to complete. Then exit the menu.");
+            }
+        }
+        else if (incoming == 14)
+        {
+            settings.enablePsram ^= 1;
+        }
+        else if (incoming == 15)
+        {
+            settings.debugEspNow ^= 1;
+        }
+        else if (incoming == 16)
+        {
+            settings.debugLora ^= 1;
+        }
+        else if (incoming == 17 && present.radio_lora)
+        {
+            if (loraCreatePassthroughFile() == true)
+            {
+                systemPrintln();
+                systemPrintln("STM32 passthrough mode has been recorded to LittleFS. Device will now reset.");
+                systemFlush(); // Complete prints
+
+                ESP.restart();
+            }
+        }
+        else if (incoming == 18)
+        {
+            systemPrintf("LittleFS total bytes: %d\r\n", LittleFS.totalBytes());
+            systemPrintf("LittleFS used bytes: %d\r\n", LittleFS.usedBytes());
+        }
+        else if (incoming == 19)
+        {
+            settings.debugCLI ^= 1;
+        }
+        else if (incoming == 20)
+        {
+            systemPrintf("Enter millisecond delay (%d to %d) for CLI LIST command over BLE: ", 0, 1000);
+            int newDelay = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newDelay != INPUT_RESPONSE_GETNUMBER_EXIT) && (newDelay != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if ((newDelay >= 0) && (newDelay <= 1000))
+                    settings.cliBlePrintDelay_ms = newDelay;
+            }
+        }
+        else if (incoming == 21)
+        {
+            systemPrintf("Enter double-tap interval (milliseconds, %d to %d): ", 250, 1000);
+            int newInterval = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newInterval != INPUT_RESPONSE_GETNUMBER_EXIT) && (newInterval != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if ((newInterval >= 250) && (newInterval <= 1000))
+                    settings.defaultDoubleTapInterval_ms = newInterval;
+            }
+        }
+        else if (incoming == 22)
+        {
+            settings.debugGnssConfig ^= 1;
+        }
+        else if (incoming == 23)
+        {
+            // Set all bits in the request bitfield to cause the GNSS receiver to go through a full (re)configuration
+            gnssConfigureDefaults();
+        }
+
+        else if (incoming == 24)
+        {
+            systemPrint("Enter new protocol name: ");
+            getUserInputString(settings.eaProtocol, sizeof(settings.eaProtocol));
+            recordSystemSettings();
+            systemPrintln("\r\n** Please reconnect to the Device to apply the changes **");
+        }
+
+        else if (incoming == 25)
+            settings.debugRtcmBuffers ^= 1;
+
+        else if (incoming == 26 && present.radio_lora)
+        {
+            if (loraCreateRxDirectFile() == true)
+            {
+                systemPrintln();
+                systemPrintln("STM32 RX passthrough mode has been recorded to LittleFS. Device will now reset.");
+                systemFlush(); // Complete prints
+
+                ESP.restart();
+            }
+        }
+
+        else if (incoming == 27 && present.radio_lora)
+        {
+            if (loraCreateTxDirectFile() == true)
+            {
+                systemPrintln();
+                systemPrintln("STM32 TX mode has been recorded to LittleFS. Device will now reset.");
+                systemFlush(); // Complete prints
+
+                ESP.restart();
+            }
+        }
+
+        else if (incoming == 28 && present.imu_im19)
+        {
+            if (imuCreatePassthroughFile() == true)
+            {
+                systemPrintln();
+                systemPrintln("IM19 passthrough mode has been recorded to LittleFS. Device will now reset.");
+                systemFlush(); // Complete prints
+
+                ESP.restart();
+            }
+        }
+        else if (incoming == 'c')
+            systemDisplayConfiguration();
+        else if (incoming == 'e')
+        {
+            systemPrintln("Erasing LittleFS and resetting");
+            LittleFS.format();
+            ESP.restart();
+        }
+
+        else if (incoming == 'p')
+            displayProductResistorTable();
+
+        // Menu exit control
+        else if (incoming == 'r')
+        {
+            recordSystemSettings();
+
+            ESP.restart();
+        }
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+// Toggle debug settings for the network
+void menuDebugNetwork()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Debug Network");
+
+        // Ethernet
+        systemPrint("1) Print Ethernet diagnostics: ");
+        systemPrintf("%s\r\n", settings.enablePrintEthernetDiag ? "Enabled" : "Disabled");
+
+        // WiFi
+        systemPrint("3) Debug WiFi state: ");
+        systemPrintf("%s\r\n", settings.debugWifiState ? "Enabled" : "Disabled");
+
+        // WiFi Config
+        systemPrint("4) Debug Web Server: ");
+        systemPrintf("%s\r\n", settings.debugWebServer ? "Enabled" : "Disabled");
+
+        // Network
+        systemPrint("10) Debug network layer: ");
+        systemPrintf("%s\r\n", settings.debugNetworkLayer ? "Enabled" : "Disabled");
+
+        systemPrint("11) Print network layer status: ");
+        systemPrintf("%s\r\n", settings.printNetworkStatus ? "Enabled" : "Disabled");
+
+        systemPrintf("12) NetworkClient write timeout: %ldms\r\n", settings.networkClientWriteTimeout_ms);
+
+        systemPrint("13) Debug AppleAccessory: ");
+        systemPrintf("%s\r\n", settings.debugAppleAccessory ? "Enabled" : "Disabled");
+
+        // NTP
+        systemPrint("20) Debug NTP: ");
+        systemPrintf("%s\r\n", settings.debugNtp ? "Enabled" : "Disabled");
+
+        // NTRIP Client
+        systemPrint("21) Debug NTRIP client state: ");
+        systemPrintf("%s\r\n", settings.debugNtripClientState ? "Enabled" : "Disabled");
+
+        systemPrint("22) Debug NTRIP client --> caster GGA messages: ");
+        systemPrintf("%s\r\n", settings.debugNtripClientRtcm ? "Enabled" : "Disabled");
+
+        // NTRIP Server
+        systemPrint("23) Debug NTRIP server state: ");
+        systemPrintf("%s\r\n", settings.debugNtripServerState ? "Enabled" : "Disabled");
+
+        systemPrint("24) Debug caster --> NTRIP server GNSS messages: ");
+        systemPrintf("%s\r\n", settings.debugNtripServerRtcm ? "Enabled" : "Disabled");
+
+        // TCP Client
+        systemPrint("25) Debug TCP client: ");
+        systemPrintf("%s\r\n", settings.debugTcpClient ? "Enabled" : "Disabled");
+
+        // TCP Server
+        systemPrint("26) Debug TCP server: ");
+        systemPrintf("%s\r\n", settings.debugTcpServer ? "Enabled" : "Disabled");
+
+        // UDP Server
+        systemPrint("27) Debug UDP server: ");
+        systemPrintf("%s\r\n", settings.debugUdpServer ? "Enabled" : "Disabled");
+
+        // MQTT Client
+        systemPrint("28) Debug MQTT client data: ");
+        systemPrintf("%s\r\n", settings.debugMqttClientData ? "Enabled" : "Disabled");
+        systemPrint("29) Debug MQTT client state: ");
+        systemPrintf("%s\r\n", settings.debugMqttClientState ? "Enabled" : "Disabled");
+
+        // HTTP Client
+        systemPrint("30) Debug HTTP client data: ");
+        systemPrintf("%s\r\n", settings.debugHttpClientData ? "Enabled" : "Disabled");
+        systemPrint("31) Debug HTTP client state: ");
+        systemPrintf("%s\r\n", settings.debugHttpClientState ? "Enabled" : "Disabled");
+
+        systemPrintln("r) Force system reset");
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+            settings.enablePrintEthernetDiag ^= 1;
+        else if (incoming == 3)
+            settings.debugWifiState ^= 1;
+        else if (incoming == 4)
+            settings.debugWebServer ^= 1;
+        else if (incoming == 10)
+            settings.debugNetworkLayer ^= 1;
+        else if (incoming == 11)
+            settings.printNetworkStatus ^= 1;
+        else if (incoming == 12)
+        {
+            systemPrintf("Enter NetworkClient timeout (%d to %d): ", 100, 3000);
+            int newDelay = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newDelay != INPUT_RESPONSE_GETNUMBER_EXIT) && (newDelay != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if ((newDelay >= 100) && (newDelay <= 3000))
+                    settings.networkClientWriteTimeout_ms = newDelay;
+            }
+        }
+        else if (incoming == 13)
+            settings.debugAppleAccessory ^= 1;
+        else if (incoming == 20)
+            settings.debugNtp ^= 1;
+        else if (incoming == 21)
+            settings.debugNtripClientState ^= 1;
+        else if (incoming == 22)
+            settings.debugNtripClientRtcm ^= 1;
+        else if (incoming == 23)
+            settings.debugNtripServerState ^= 1;
+        else if (incoming == 24)
+            settings.debugNtripServerRtcm ^= 1;
+        else if (incoming == 25)
+            settings.debugTcpClient ^= 1;
+        else if (incoming == 26)
+            settings.debugTcpServer ^= 1;
+        else if (incoming == 27)
+            settings.debugUdpServer ^= 1;
+        else if (incoming == 28)
+            settings.debugMqttClientData ^= 1;
+        else if (incoming == 29)
+            settings.debugMqttClientState ^= 1;
+        else if (incoming == 30)
+            settings.debugHttpClientData ^= 1;
+        else if (incoming == 31)
+            settings.debugHttpClientState ^= 1;
+
+        // Menu exit control
+        else if (incoming == 'r')
+        {
+            recordSystemSettings();
+
+            ESP.restart();
+        }
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+// Toggle debug settings for software
+void menuDebugSoftware()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Debug Software");
+
+        // Heap
+        systemPrint("1) Heap Reporting: ");
+        systemPrintf("%s\r\n", settings.enableHeapReport ? "Enabled" : "Disabled");
+
+        systemPrintf("2) Set level to use PSRAM (bytes): %d\r\n", settings.psramMallocLevel);
+
+        systemPrintf("3) WiFi Connect Timeout (ms): %d\r\n", settings.wifiConnectTimeoutMs);
+
+        systemPrintf("4) Debug malloc/free and new/delete: %s\r\n", settings.debugMalloc ? "Enabled" : "Disabled");
+
+        // Ring buffer
+        systemPrint("10) Print ring buffer offsets: ");
+        systemPrintf("%s\r\n", settings.enablePrintRingBufferOffsets ? "Enabled" : "Disabled");
+
+        systemPrint("11) Print ring buffer overruns: ");
+        systemPrintf("%s\r\n", settings.enablePrintBufferOverrun ? "Enabled" : "Disabled");
+
+        systemPrint("12) Validate incoming RTCM before sending the NTRIP Server: ");
+        systemPrintf("%s\r\n", settings.enableRtcmMessageChecking ? "Enabled" : "Disabled");
+
+        // Rover
+        systemPrint("20) Print Rover accuracy messages: ");
+        systemPrintf("%s\r\n", settings.enablePrintRoverAccuracy ? "Enabled" : "Disabled");
+
+        // RTK
+        systemPrint("30) Print states: ");
+        systemPrintf("%s\r\n", settings.enablePrintStates ? "Enabled" : "Disabled");
+
+        systemPrint("31) Print duplicate states: ");
+        systemPrintf("%s\r\n", settings.enablePrintDuplicateStates ? "Enabled" : "Disabled");
+
+        systemPrintf("33) Print boot times: %s\r\n", settings.printBootTimes ? "Enabled" : "Disabled");
+
+        systemPrintf("34) Print partition table: %s\r\n", settings.printPartitionTable ? "Enabled" : "Disabled");
+
+        // Debug
+
+        systemPrintf("40) Print LittleFS and settings management: %s\r\n",
+                     settings.debugSettings ? "Enabled" : "Disabled");
+        systemPrintf("41) Halt on ESP_RST_PANIC: %s\r\n", settings.haltOnPanic ? "Enabled" : "Disabled");
+
+        // Tasks
+        systemPrint("50) Task Highwater Reporting: ");
+        if (settings.enableTaskReports == true)
+            systemPrintln("Enabled");
+        else
+            systemPrintln("Disabled");
+        systemPrintf("51) Print task start/stop: %s\r\n", settings.printTaskStartStop ? "Enabled" : "Disabled");
+
+        // Automatic Firmware Update
+        systemPrintf("60) Print firmware update states: %s\r\n", settings.debugFirmwareUpdate ? "Enabled" : "Disabled");
+
+        // Point Perfect
+        systemPrintf("70) Point Perfect certificate management: %s\r\n",
+                     settings.debugPpCertificate ? "Enabled" : "Disabled");
+
+        systemPrintln("e) Erase LittleFS");
+
+        systemPrintln("r) Force system reset");
+
+        systemPrintln("t) Display task list");
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+            settings.enableHeapReport ^= 1;
+        else if (incoming == 2)
+        {
+            getNewSetting("Enter level to use PSRAM in bytes", 0, 65535, &settings.psramMallocLevel);
+        }
+        else if (incoming == 3)
+        {
+            getNewSetting("Enter WiFi connect timeout in ms", 1000, 120000, &settings.wifiConnectTimeoutMs);
+        }
+        else if (incoming == 4)
+            settings.debugMalloc ^= 1;
+        else if (incoming == 10)
+            settings.enablePrintRingBufferOffsets ^= 1;
+        else if (incoming == 11)
+            settings.enablePrintBufferOverrun ^= 1;
+        else if (incoming == 12)
+            settings.enableRtcmMessageChecking ^= 1;
+        else if (incoming == 20)
+            settings.enablePrintRoverAccuracy ^= 1;
+        else if (incoming == 30)
+            settings.enablePrintStates ^= 1;
+        else if (incoming == 31)
+            settings.enablePrintDuplicateStates ^= 1;
+        else if (incoming == 33)
+            settings.printBootTimes ^= 1;
+        else if (incoming == 34)
+            settings.printPartitionTable ^= 1;
+
+        else if (incoming == 40)
+            settings.debugSettings ^= 1;
+        else if (incoming == 41)
+            settings.haltOnPanic ^= 1;
+
+        else if (incoming == 50)
+            settings.enableTaskReports ^= 1;
+        else if (incoming == 51)
+            settings.printTaskStartStop ^= 1;
+        else if (incoming == 60)
+            settings.debugFirmwareUpdate ^= 1;
+        else if (incoming == 70)
+            settings.debugPpCertificate ^= 1;
+        else if (incoming == 'e')
+        {
+            systemPrintln("Erasing LittleFS and resetting");
+            LittleFS.format();
+            ESP.restart();
+        }
+
+        // Menu exit control
+        else if (incoming == 'r')
+        {
+            tasksStopGnssUart(); // Stop tasks writing data to SD
+
+            recordSystemSettings(); // Save settings now SD writing is stopped
+
+            ESP.restart();
+        }
+        else if (incoming == 't')
+            rtkTaskList(&Serial);
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+// Configure the RTK operation
+void menuOperation()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: RTK Operation");
+
+        // Display
+        systemPrintf("1) Display Reset Counter: %d - ", settings.resetCount);
+        if (settings.enableResetDisplay == true)
+            systemPrintln("Enabled");
+        else
+            systemPrintln("Disabled");
+
+        // GNSS
+        systemPrint("2) GNSS Serial Timeout: ");
+        systemPrintln(settings.serialTimeoutGNSS);
+
+        systemPrint("3) GNSS Handler Buffer Size: ");
+        systemPrintln(settings.gnssHandlerBufferSize);
+
+        systemPrint("4) GNSS Serial RX Full Threshold: ");
+        systemPrintln(settings.serialGNSSRxFullThreshold);
+
+        // SPI
+        systemPrint("6) SPI/SD Interface Frequency: ");
+        systemPrint(settings.spiFrequency);
+        systemPrintln(" MHz");
+
+        // SPP
+        systemPrint("7) SPP RX Buffer Size: ");
+        systemPrintln(settings.sppRxQueueSize);
+
+        systemPrint("8) SPP TX Buffer Size: ");
+        systemPrintln(settings.sppTxQueueSize);
+
+        // UART
+        systemPrint("9) UART Receive Buffer Size: ");
+        systemPrintln(settings.uartReceiveBufferSize);
+
+        // Tilt
+        systemPrintf("10) Force Tilt detect\r\n");
+
+        // PPL Float Lock timeout
+        systemPrint("11) Set PPL RTK Fix Timeout (seconds): ");
+        if (settings.pplFixTimeoutS > 0)
+            systemPrintln(settings.pplFixTimeoutS);
+        else
+            systemPrintln("Disabled - no resets");
+
+        systemPrintln("----  Interrupts  ----");
+        systemPrint("30) Bluetooth Interrupts Core: ");
+        systemPrintln(settings.bluetoothInterruptsCore);
+
+        systemPrint("31) GNSS UART Interrupts Core: ");
+        systemPrintln(settings.gnssUartInterruptsCore);
+
+        systemPrint("32) I2C Interrupts Core: ");
+        systemPrintln(settings.i2cInterruptsCore);
+
+        // Tasks
+        systemPrintln("-------  Tasks  ------");
+        systemPrint("50) BT Read Task Core: ");
+        systemPrintln(settings.btReadTaskCore);
+        systemPrint("51) BT Read Task Priority: ");
+        systemPrintln(settings.btReadTaskPriority);
+
+        systemPrint("52) GNSS Data Handler Core: ");
+        systemPrintln(settings.handleGnssDataTaskCore);
+        systemPrint("53) GNSS Data Handler Task Priority: ");
+        systemPrintln(settings.handleGnssDataTaskPriority);
+
+        systemPrint("54) GNSS Read Task Core: ");
+        systemPrintln(settings.gnssReadTaskCore);
+        systemPrint("55) GNSS Read Task Priority: ");
+        systemPrintln(settings.gnssReadTaskPriority);
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+        {
+            settings.enableResetDisplay ^= 1;
+            if (settings.enableResetDisplay == true)
+            {
+                settings.resetCount = 0;
+                recordSystemSettings(); // Record to NVM
+            }
+        }
+        else if (incoming == 2)
+        {
+            getNewSetting("Enter GNSS Serial Timeout in milliseconds", 0, 1000, &settings.serialTimeoutGNSS);
+        }
+        else if (incoming == 3)
+        {
+            systemPrintln("Warning: changing the Handler Buffer Size will restart the device.");
+            if (getNewSetting("Enter GNSS Handler Buffer Size in Bytes", 32, 65535, &settings.gnssHandlerBufferSize) ==
+                INPUT_RESPONSE_VALID)
+            {
+                // Stop the GNSS UART tasks to prevent the system from crashing
+                tasksStopGnssUart();
+
+                recordSystemSettings();
+
+                // Reboot the system
+                ESP.restart();
+            }
+        }
+        else if (incoming == 4)
+        {
+            getNewSetting("Enter Serial GNSS RX Full Threshold", 1, 127, &settings.serialGNSSRxFullThreshold);
+        }
+
+        else if (incoming == 6)
+        {
+            getNewSetting("Enter SPI frequency in MHz", 1, 16, &settings.spiFrequency);
+        }
+        else if (incoming == 7)
+        {
+            getNewSetting("Enter SPP RX Queue Size in Bytes", 32, 16384, &settings.sppRxQueueSize);
+        }
+        else if (incoming == 8)
+        {
+            getNewSetting("Enter SPP TX Queue Size in Bytes", 32, 16384, &settings.sppTxQueueSize);
+        }
+        else if (incoming == 9)
+        {
+            systemPrintln("Warning: changing the Receive Buffer Size will restart the device.");
+
+            if (getNewSetting("Enter UART Receive Buffer Size in Bytes", 32, 16384, &settings.uartReceiveBufferSize) ==
+                INPUT_RESPONSE_VALID)
+            {
+                recordSystemSettings();
+                ESP.restart();
+            }
+        }
+
+        // Allow the user to force tilt detection in case they switched the GNSS
+        // board in the Facet FP to one with the same GNSS but now has the tilt sensor
+        else if (incoming == 10)
+            tiltForceDetectionReboot();
+        else if (incoming == 11)
+        {
+            getNewSetting("Enter number of seconds in RTK float using PPL, before reset", 0, 3600,
+                          &settings.pplFixTimeoutS); // Arbitrary 60 minute limit
+        }
+
+        else if (incoming == 30)
+        {
+            getNewSetting("Not yet implemented! - Enter Core used for Bluetooth Interrupts", 0, 1,
+                          &settings.bluetoothInterruptsCore);
+        }
+        else if (incoming == 31)
+        {
+            getNewSetting("Enter Core used for GNSS UART Interrupts", 0, 1, &settings.gnssUartInterruptsCore);
+        }
+        else if (incoming == 32)
+        {
+            systemPrintln("\r\nI2C Interrupts Core can not be changed here.");
+            systemPrintln("It is needed before the settings are loaded.");
+            systemPrintln("Change in settings and recompile.");
+        }
+        else if (incoming == 50)
+        {
+            getNewSetting("Enter BT Read Task Core", 0, 1, &settings.btReadTaskCore);
+        }
+        else if (incoming == 51)
+        {
+            getNewSetting("Enter BT Read Task Priority", 0, 3, &settings.btReadTaskPriority);
+        }
+        else if (incoming == 52)
+        {
+            getNewSetting("Enter GNSS Data Handler Task Core", 0, 1, &settings.handleGnssDataTaskCore);
+        }
+        else if (incoming == 53)
+        {
+            getNewSetting("Enter GNSS Data Handle Task Priority", 0, 3, &settings.handleGnssDataTaskPriority);
+        }
+        else if (incoming == 54)
+        {
+            getNewSetting("Enter GNSS Read Task Core", 0, 1, &settings.gnssReadTaskCore);
+        }
+        else if (incoming == 55)
+        {
+            getNewSetting("Enter GNSS Read Task Priority", 0, 3, &settings.gnssReadTaskPriority);
+        }
+
+        // Menu exit control
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+// Toggle periodic print message enables
+void menuPeriodicPrint()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Periodic Print Messages");
+
+        systemPrintln("-----  Hardware  -----");
+        systemPrint("1) Bluetooth RX: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_BLUETOOTH_DATA_RX) ? "Enabled" : "Disabled");
+
+        systemPrint("2) Bluetooth TX: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_BLUETOOTH_DATA_TX) ? "Enabled" : "Disabled");
+
+        systemPrint("3) Ethernet IP address: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_IP_ADDRESS) ? "Enabled" : "Disabled");
+
+        systemPrint("4) Ethernet state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_ETHERNET_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("5) SD log write data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_SD_LOG_WRITE) ? "Enabled" : "Disabled");
+
+        systemPrint("7) WiFi state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_WIFI_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("8) GNSS RX data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_GNSS_DATA_RX) ? "Enabled" : "Disabled");
+
+        systemPrint("9) GNSS TX data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_GNSS_DATA_TX) ? "Enabled" : "Disabled");
+
+        systemPrint("10) GNSS RX byte count: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_GNSS_DATA_RX_BYTE_COUNT) ? "Enabled" : "Disabled");
+
+        systemPrintln("-----  Software  -----");
+
+        systemPrintf("20) Periodic print: %llu (0x%016llx)\r\n", settings.periodicDisplay, settings.periodicDisplay);
+
+        systemPrintf("21) Interval (seconds): %d\r\n", settings.periodicDisplayInterval / 1000);
+
+        systemPrint("22) CPU idle time: ");
+        systemPrintf("%s\r\n", settings.enablePrintIdleTime ? "Enabled" : "Disabled");
+
+        systemPrint("23) Network state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NETWORK_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("24) Ring buffer consumer times: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_RING_BUFFER_MILLIS) ? "Enabled" : "Disabled");
+
+        systemPrint("25) RTK position: ");
+        systemPrintf("%s\r\n", settings.enablePrintPosition ? "Enabled" : "Disabled");
+
+        systemPrint("26) RTK state: ");
+        systemPrintf("%s\r\n", settings.enablePrintStates ? "Enabled" : "Disabled");
+
+        systemPrint("27) RTK correction source: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_CORRECTION_SOURCE) ? "Enabled" : "Disabled");
+
+        systemPrint("28) Firmware mode: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_FIRMWARE_MODE) ? "Enabled" : "Disabled");
+
+        systemPrintln("------  Clients  -----");
+        systemPrint("40) NTP server data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTP_SERVER_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("41) NTP server state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTP_SERVER_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("42) NTRIP client data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTRIP_CLIENT_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("43) NTRIP client GGA writes: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTRIP_CLIENT_GGA) ? "Enabled" : "Disabled");
+
+        systemPrint("44) NTRIP client state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTRIP_CLIENT_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("45) NTRIP server data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTRIP_SERVER_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("46) NTRIP server state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_NTRIP_SERVER_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("47) TCP client data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TCP_CLIENT_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("48) TCP client state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TCP_CLIENT_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("49) TCP server client data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TCP_SERVER_CLIENT_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("50) TCP server data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TCP_SERVER_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("51) TCP server state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TCP_SERVER_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("52) MQTT client data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_MQTT_CLIENT_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("53) MQTT client state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_MQTT_CLIENT_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("54) HTTP client state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_HTTP_CLIENT_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("55) Provisioning state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_PROVISIONING_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("56) UDP server state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_UDP_SERVER_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("57) UDP server data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_UDP_SERVER_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("58) UDP server broadcast data: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_UDP_SERVER_BROADCAST_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("59) WebServer state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_WEB_SERVER_STATE) ? "Enabled" : "Disabled");
+
+        systemPrint("60) OTA firmware update state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_OTA_STATE) ? "Enabled" : "Disabled");
+
+        systemPrintln("-------  Tasks  ------");
+        systemPrint("70) btReadTask state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TASK_BLUETOOTH_READ) ? "Enabled" : "Disabled");
+
+        systemPrint("71) ButtonCheckTask state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TASK_BUTTON_CHECK) ? "Enabled" : "Disabled");
+
+        systemPrint("72) gnssReadTask state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TASK_GNSS_READ) ? "Enabled" : "Disabled");
+
+        systemPrint("73) handleGnssDataTask state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TASK_HANDLE_GNSS_DATA) ? "Enabled" : "Disabled");
+
+        systemPrint("74) sdSizeCheckTask state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TASK_SD_SIZE_CHECK) ? "Enabled" : "Disabled");
+
+        systemPrint("75) WebServerTask state: ");
+        systemPrintf("%s\r\n", PERIODIC_SETTING(PD_TASK_UPDATE_WEBSERVER) ? "Enabled" : "Disabled");
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+            PERIODIC_TOGGLE(PD_BLUETOOTH_DATA_RX);
+        else if (incoming == 2)
+            PERIODIC_TOGGLE(PD_BLUETOOTH_DATA_TX);
+        else if (incoming == 3)
+            PERIODIC_TOGGLE(PD_IP_ADDRESS);
+        else if (incoming == 4)
+            PERIODIC_TOGGLE(PD_ETHERNET_STATE);
+        else if (incoming == 5)
+            PERIODIC_TOGGLE(PD_SD_LOG_WRITE);
+        else if (incoming == 7)
+            PERIODIC_TOGGLE(PD_WIFI_STATE);
+        else if (incoming == 8)
+            PERIODIC_TOGGLE(PD_GNSS_DATA_RX);
+        else if (incoming == 9)
+            PERIODIC_TOGGLE(PD_GNSS_DATA_TX);
+        else if (incoming == 10)
+            PERIODIC_TOGGLE(PD_GNSS_DATA_RX_BYTE_COUNT);
+
+        else if (incoming == 20)
+        {
+            systemPrint("Enter the new periodic print mask: ");
+            int value = getUserInputNumber();
+            if ((value != INPUT_RESPONSE_GETNUMBER_EXIT) && (value != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+                settings.periodicDisplay = value;
+        }
+        else if (incoming == 21)
+        {
+            systemPrint("Enter the new periodic display interval (s): ");
+            int seconds = getUserInputNumber();
+            if ((seconds != INPUT_RESPONSE_GETNUMBER_EXIT) && (seconds != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+                settings.periodicDisplayInterval = seconds * 1000;
+        }
+        else if (incoming == 22)
+            settings.enablePrintIdleTime ^= 1;
+        else if (incoming == 23)
+            PERIODIC_TOGGLE(PD_NETWORK_STATE);
+        else if (incoming == 24)
+            PERIODIC_TOGGLE(PD_RING_BUFFER_MILLIS);
+        else if (incoming == 25)
+            settings.enablePrintPosition ^= 1;
+        else if (incoming == 26)
+            settings.enablePrintStates ^= 1;
+        else if (incoming == 27)
+            PERIODIC_TOGGLE(PD_CORRECTION_SOURCE);
+        else if (incoming == 28)
+            PERIODIC_TOGGLE(PD_FIRMWARE_MODE);
+
+        else if (incoming == 40)
+            PERIODIC_TOGGLE(PD_NTP_SERVER_DATA);
+        else if (incoming == 41)
+            PERIODIC_TOGGLE(PD_NTP_SERVER_STATE);
+        else if (incoming == 42)
+            PERIODIC_TOGGLE(PD_NTRIP_CLIENT_DATA);
+        else if (incoming == 43)
+            PERIODIC_TOGGLE(PD_NTRIP_CLIENT_GGA);
+        else if (incoming == 44)
+            PERIODIC_TOGGLE(PD_NTRIP_CLIENT_STATE);
+        else if (incoming == 45)
+            PERIODIC_TOGGLE(PD_NTRIP_SERVER_DATA);
+        else if (incoming == 46)
+            PERIODIC_TOGGLE(PD_NTRIP_SERVER_STATE);
+        else if (incoming == 47)
+            PERIODIC_TOGGLE(PD_TCP_CLIENT_DATA);
+        else if (incoming == 48)
+            PERIODIC_TOGGLE(PD_TCP_CLIENT_STATE);
+        else if (incoming == 49)
+            PERIODIC_TOGGLE(PD_TCP_SERVER_CLIENT_DATA);
+        else if (incoming == 50)
+            PERIODIC_TOGGLE(PD_TCP_SERVER_DATA);
+        else if (incoming == 51)
+            PERIODIC_TOGGLE(PD_TCP_SERVER_STATE);
+        else if (incoming == 52)
+            PERIODIC_TOGGLE(PD_MQTT_CLIENT_DATA);
+        else if (incoming == 53)
+            PERIODIC_TOGGLE(PD_MQTT_CLIENT_STATE);
+        else if (incoming == 54)
+            PERIODIC_TOGGLE(PD_HTTP_CLIENT_STATE);
+        else if (incoming == 55)
+            PERIODIC_TOGGLE(PD_PROVISIONING_STATE);
+        else if (incoming == 56)
+            PERIODIC_TOGGLE(PD_UDP_SERVER_STATE);
+        else if (incoming == 57)
+            PERIODIC_TOGGLE(PD_UDP_SERVER_DATA);
+        else if (incoming == 58)
+            PERIODIC_TOGGLE(PD_UDP_SERVER_BROADCAST_DATA);
+        else if (incoming == 59)
+            PERIODIC_TOGGLE(PD_WEB_SERVER_STATE);
+        else if (incoming == 60)
+            PERIODIC_TOGGLE(PD_OTA_STATE);
+
+        else if (incoming == 70)
+            PERIODIC_TOGGLE(PD_TASK_BLUETOOTH_READ);
+        else if (incoming == 71)
+            PERIODIC_TOGGLE(PD_TASK_BUTTON_CHECK);
+        else if (incoming == 72)
+            PERIODIC_TOGGLE(PD_TASK_GNSS_READ);
+        else if (incoming == 73)
+            PERIODIC_TOGGLE(PD_TASK_HANDLE_GNSS_DATA);
+        else if (incoming == 74)
+            PERIODIC_TOGGLE(PD_TASK_SD_SIZE_CHECK);
+        else if (incoming == 75)
+            PERIODIC_TOGGLE(PD_TASK_UPDATE_WEBSERVER);
+
+        // Menu exit control
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#endif // COMPILE_MENU_SYSTEM
+
+#ifdef COMPILE_MENU_INSTRUMENTS
+
+// Get the parameters for the antenna height, reference point, and tilt compensation
+void menuInstrument()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Instrument Setup");
+
+        if (online.imu_im19 == true)
+            systemPrintf("IMU firmware: %s\r\n", imuFirmwareVersionStr);
+
+        // Print the combined APC
+        systemPrintf("Combined Height of Instrument: %0.3fm\r\n",
+                     ((settings.antennaHeight_mm + settings.antennaPhaseCenter_mm) / 1000.0));
+
+        systemPrintf("1) Set Antenna Height (a.k.a. Pole Length): %0.3lfm\r\n",
+                     settings.antennaHeight_mm / (double)1000.0);
+
+        systemPrintf("2) Set Antenna Phase Center: %0.1fmm\r\n", settings.antennaPhaseCenter_mm);
+
+        systemPrint("3) Report Tip Altitude: ");
+        systemPrintf("%s\r\n", settings.outputTipAltitude ? "Enabled" : "Disabled");
+
+        if (present.imu_im19)
+        {
+            systemPrint("4) Tilt Compensation: ");
+            systemPrintf("%s\r\n", settings.enableTiltCompensation ? "Enabled" : "Disabled");
+        }
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+        {
+            double antennaHeight = 0;
+
+            if (getNewSetting("Enter the antenna height (a.k.a. pole length) in meters", -15.0, 15.0, &antennaHeight) ==
+                INPUT_RESPONSE_VALID)
+                settings.antennaHeight_mm = truncf(antennaHeight * 1000.0);
+        }
+        else if (incoming == 2)
+        {
+            getNewSetting("Enter the antenna phase center (a.k.a. ARP) in millimeters. Common antennas "
+                          "Torch=116mm",
+                          -200.0, 200.0, &settings.antennaPhaseCenter_mm);
+        }
+        else if (incoming == 3)
+        {
+            settings.outputTipAltitude ^= 1;
+        }
+        else if (incoming == 4 && present.imu_im19)
+        {
+            settings.enableTiltCompensation ^= 1;
+        }
+
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#endif // COMPILE_MENU_INSTRUMENTS

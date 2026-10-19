@@ -1,0 +1,469 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+menuPorts.ino
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+#ifdef  COMPILE_MENU_PORTS
+
+void menuPorts()
+{
+    if (productVariant == RTK_FACET_MOSAIC)
+    {
+        // RTK Facet mosaic-X5 (present.portDataMux == true)
+        menuPortsMultiplexed();
+    }
+    else if ((productVariant == RTK_TORCH) || (productVariant == RTK_TORCH_X2))
+    {
+        // RTK Torch, RTK Torch X2
+        menuPortsUsb();
+    }
+    else if ((productVariant == RTK_EVK) || (productVariant == RTK_POSTCARD)
+             || (productVariant == RTK_FACET_FP))
+    {
+        // RTK EVK, Postcard, Facet FP
+        menuPortsNoMux();
+    }
+    else
+        systemPrintln("Menu Ports: Uncaught platform");
+}
+
+// Configure a single port interface (USB only)
+void menuPortsUsb()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Ports");
+
+        systemPrintf("1) Output GNSS data to USB serial: %s\r\n",
+                     settings.enableGnssToUsbSerial ? "Enabled" : "Disabled");
+
+        systemPrintln("x) Exit");
+
+        int incoming = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+        if (incoming == 1)
+            settings.enableGnssToUsbSerial ^= 1;
+
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_EXIT)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+// Set the baud rates for the radio and data ports
+void menuPortsNoMux()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Ports");
+
+        systemPrint("1) Set serial baud rate for Radio Port: ");
+        systemPrint(settings.radioPortBaud);
+        systemPrintln(" bps");
+
+        systemPrint("2) Set serial baud rate for Data Port: ");
+        systemPrint(settings.dataPortBaud);
+        systemPrintln(" bps");
+
+        systemPrintf("3) Output GNSS data to USB serial: %s\r\n",
+                     settings.enableGnssToUsbSerial ? "Enabled" : "Disabled");
+
+        // EVK has no mux. Postcard has no mux. Facet FP has no mux.
+        // Facet mosaic does have a mux. See menuPortsMultiplexed
+
+        if (productVariant == RTK_FACET_FP)
+        {
+            systemPrintf("4) Allow incoming corrections on Ext Radio: %s\r\n",
+                         settings.enableExtCorrRadio ? "Enabled" : "Disabled");
+
+            // X20P / F9P UART2 is limited to RTCM. No need to change settings.enableNmeaOnRadio
+            if (present.gnss_lg290p || present.gnss_mosaicX5)
+            {
+                systemPrintf("5) Limit Ext Radio and LoRa output to RTCM: %s\r\n",
+                            settings.enableNmeaOnRadio ? "Disabled"
+                                                        : "Enabled"); // Reverse disabled/enabled to align with prompt
+            }
+        }
+        else if (productVariant == RTK_POSTCARD)
+        {
+            systemPrintf("4) Allow incoming corrections on RADIO port: %s\r\n",
+                         settings.enableExtCorrRadio ? "Enabled" : "Disabled");
+
+            systemPrintf("5) Limit RADIO port output to RTCM: %s\r\n",
+                         settings.enableNmeaOnRadio ? "Disabled"
+                                                    : "Enabled"); // Reverse disabled/enabled to align with prompt
+        }
+        else // if (productVariant == RTK_EVK)
+        {
+            systemPrintf("4) Allow incoming corrections on GNSS UART2: %s\r\n",
+                         settings.enableExtCorrRadio ? "Enabled" : "Disabled");
+
+            // F9P UART2 is limited to RTCM. No need to change settings.enableNmeaOnRadio
+        }
+
+        systemPrintln("x) Exit");
+
+        int incoming = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+        if (incoming == 1)
+        {
+            systemPrintf("Enter baud rate (%d to %d) for Radio Port: ", gnss->baudGetMinimum(), gnss->baudGetMaximum());
+            int newBaud = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newBaud != INPUT_RESPONSE_GETNUMBER_EXIT) && (newBaud != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if (gnss->baudIsAllowed(newBaud))
+                {
+                    settings.radioPortBaud = newBaud;
+                    gnssConfigure(GNSS_CONFIG_BAUD_RATE_RADIO); // Request receiver to use new settings
+                }
+                else
+                {
+                    systemPrintln("Error: Baud rate out of range");
+                }
+            }
+        }
+        else if (incoming == 2)
+        {
+            systemPrintf("Enter baud rate (%d to %d) for Data Port: ", gnss->baudGetMinimum(), gnss->baudGetMaximum());
+            int newBaud = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newBaud != INPUT_RESPONSE_GETNUMBER_EXIT) && (newBaud != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if (gnss->baudIsAllowed(newBaud))
+                {
+                    settings.dataPortBaud = newBaud;
+                    gnssConfigure(GNSS_CONFIG_BAUD_RATE_DATA); // Request receiver to use new settings
+                }
+                else
+                {
+                    systemPrintln("Error: Baud rate out of range");
+                }
+            }
+        }
+        else if (incoming == 3)
+        {
+            settings.enableGnssToUsbSerial ^= 1;
+            if (settings.enableGnssToUsbSerial)
+                systemPrintln("GNSS to USB is enabled. To exit this mode, press +++ to open the configuration menu.");
+        }
+        else if (incoming == 4)
+        {
+            // Toggle the enable for the external corrections radio
+            settings.enableExtCorrRadio ^= 1;
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_NMEA); // We may need to enable / disable NMEA
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_OTHER); // Make sure PQTMRTCMIS is enabled on LG290P
+            gnssConfigure(GNSS_CONFIG_EXT_CORRECTIONS); // Request receiver to use new settings
+        }
+
+        // Configure settings.enableNmeaOnRadio on:
+        //  FACET_FP LG290P and mosaic-X5
+        //  POSTCARD (LG290P)
+        else if ((incoming == 5) && (present.gnss_lg290p || present.gnss_mosaicX5))
+        {
+            settings.enableNmeaOnRadio ^= 1;
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_NMEA); // We may need to enable / disable NMEA
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_OTHER); // Make sure PQTMRTCMIS is enabled on LG290P
+        }
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_EXIT)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+// Set the baud rates for the radio and data ports
+void menuPortsMultiplexed()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Ports");
+
+        systemPrint("1) Set Radio port serial baud rate: ");
+        systemPrint(settings.radioPortBaud);
+        systemPrintln(" bps");
+
+        systemPrint("2) Set Data port connections: ");
+        if (settings.dataPortChannel == MUX_GNSS_UART)
+            systemPrintln("GNSS TX Out/RX In");
+        else if (settings.dataPortChannel == MUX_PPS_EVENTTRIGGER)
+            systemPrintln("PPS OUT/Event Trigger In");
+        else if (settings.dataPortChannel == MUX_I2C_WT)
+            systemPrintln("I2C SDA/SCL");
+        else if (settings.dataPortChannel == MUX_ADC_DAC)
+            systemPrintln("ESP32 DAC Out/ADC In");
+
+        if (settings.dataPortChannel == MUX_GNSS_UART)
+        {
+            systemPrint("3) Set Data port serial baud rate: ");
+            systemPrint(settings.dataPortBaud);
+            systemPrintln(" bps");
+        }
+        else if (settings.dataPortChannel == MUX_PPS_EVENTTRIGGER)
+        {
+            systemPrintln("3) Configure External Triggers");
+        }
+
+        // Facet mosaic has a mux. Radio Ext is COM2. Data port (COM3) is mux'd.
+        if (productVariant == RTK_FACET_MOSAIC)
+        {
+            systemPrintf("4) Allow Incoming Corrections on COM2: %s\r\n",
+                         settings.enableExtCorrRadio ? "Enabled" : "Disabled");
+            systemPrintf("5) Output GNSS data to USB1 serial: %s\r\n",
+                         settings.enableGnssToUsbSerial ? "Enabled" : "Disabled");
+            systemPrintf("6) Limit RADIO port output to RTCM: %s\r\n",
+                         settings.enableNmeaOnRadio ? "Disabled"
+                                                    : "Enabled"); // Reverse disabled/enabled to align with prompt
+        }
+
+        systemPrintln("x) Exit");
+
+        int incoming = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+        if (incoming == 1)
+        {
+            systemPrintf("Enter baud rate (%d to %d) for Radio Port: ", gnss->baudGetMinimum(), gnss->baudGetMaximum());
+            int newBaud = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newBaud != INPUT_RESPONSE_GETNUMBER_EXIT) && (newBaud != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if (gnss->baudIsAllowed(newBaud))
+                {
+                    settings.radioPortBaud = newBaud;
+                    gnssConfigure(GNSS_CONFIG_BAUD_RATE_RADIO); // Request receiver to use new settings
+                }
+                else
+                {
+                    systemPrintln("Error: Baud rate out of range");
+                }
+            }
+        }
+        else if (incoming == 2)
+        {
+            systemPrintln("\r\nEnter the pin connection to use (1 to 4) for Data Port: ");
+            systemPrintln("1) GNSS UART TX Out/RX In");
+            systemPrintln("2) PPS OUT/Event Trigger In");
+            systemPrintln("3) I2C SDA/SCL");
+            systemPrintln("4) ESP32 DAC Out/ADC In");
+
+            int muxPort = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if (muxPort < 1 || muxPort > 4)
+            {
+                systemPrintln("Error: Pin connection out of range");
+            }
+            else
+            {
+                settings.dataPortChannel = (muxConnectionType_e)(muxPort - 1); // Adjust user input from 1-4 to 0-3
+                setMuxport(settings.dataPortChannel);
+
+                if (muxPort == 2)
+                    gnssConfigure(GNSS_CONFIG_PPS); // Request receiver to use new settings
+            }
+        }
+        else if (incoming == 3 && settings.dataPortChannel == MUX_GNSS_UART)
+        {
+            systemPrintf("Enter baud rate (%d to %d) for Data Port: ", gnss->baudGetMinimum(), gnss->baudGetMaximum());
+            int newBaud = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+            if ((newBaud != INPUT_RESPONSE_GETNUMBER_EXIT) && (newBaud != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
+            {
+                if (gnss->baudIsAllowed(newBaud))
+                {
+                    settings.dataPortBaud = newBaud;
+                    gnssConfigure(GNSS_CONFIG_BAUD_RATE_DATA); // Request receiver to use new settings
+                }
+                else
+                {
+                    systemPrintln("Error: Baud rate out of range");
+                }
+            }
+        }
+        else if ((incoming == 3) && (settings.dataPortChannel == MUX_PPS_EVENTTRIGGER))
+        {
+            menuPortHardwareTriggers();
+        }
+        else if ((incoming == 4) && (productVariant == RTK_FACET_MOSAIC))
+        {
+            // Toggle the enable for the external corrections radio
+            settings.enableExtCorrRadio ^= 1;
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_NMEA); // We may need to enable / disable NMEA
+            gnssConfigure(GNSS_CONFIG_EXT_CORRECTIONS); // Request receiver to use new settings
+        }
+        else if ((incoming == 5) && (productVariant == RTK_FACET_MOSAIC))
+        {
+            settings.enableGnssToUsbSerial ^= 1;
+        }
+        else if ((incoming == 6) && (productVariant == RTK_FACET_MOSAIC))
+        {
+            settings.enableNmeaOnRadio ^= 1;
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_NMEA); // We may need to enable / disable NMEA
+        }
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_EXIT)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+
+    gnss->beginExternalEvent(); // Update with new settings
+}
+
+// Configure the behavior of the PPS and INT pins.
+// Most often used for logging events (inputs) and when external triggers (outputs) occur.
+// menuPortHardwareTriggers is only called by menuPortsMultiplexed.
+// Call gnss->beginExternalEvent() and gnss->setPPS() in menuPortsMultiplexed, not here
+// since menuPortsMultiplexed has control of the multiplexer
+void menuPortHardwareTriggers()
+{
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Port Hardware Trigger");
+
+        systemPrint("1) Enable External Pulse: ");
+        if (settings.enableExternalPulse == true)
+            systemPrintln("Enabled");
+        else
+            systemPrintln("Disabled");
+
+        if (settings.enableExternalPulse == true)
+        {
+            systemPrint("2) Set time between pulses: ");
+            systemPrint(settings.externalPulseTimeBetweenPulse_us / 1000.0, 0);
+            systemPrintln("ms");
+
+            systemPrint("3) Set pulse length: ");
+            systemPrint(settings.externalPulseLength_us / 1000.0, 0);
+            systemPrintln("ms");
+
+            systemPrint("4) Set pulse polarity: ");
+            if (settings.externalPulsePolarity == PULSE_RISING_EDGE)
+                systemPrintln("Rising");
+            else
+                systemPrintln("Falling");
+        }
+
+        systemPrint("5) Log External Events: ");
+        if (settings.enableExternalHardwareEventLogging == true)
+            systemPrintln("Enabled");
+        else
+            systemPrintln("Disabled");
+
+        // On the mosaic-X5, we can set the event polarity
+        if ((settings.enableExternalHardwareEventLogging == true) && present.gnss_mosaicX5)
+        {
+            systemPrint("6) External Event Polarity: ");
+            if (settings.externalEventPolarity == false)
+                systemPrintln("Low2High");
+            else
+                systemPrintln("High2Low");
+        }
+
+        systemPrintln("x) Exit");
+
+        int incoming = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+        if (incoming == 1)
+        {
+            settings.enableExternalPulse ^= 1;
+        }
+        else if (incoming == 2 && settings.enableExternalPulse == true)
+        {
+            if (present.gnss_mosaicX5)
+            {
+                systemPrintln("Select PPS interval:\r\n");
+
+                for (int y = 0; y < MAX_MOSAIC_PPS_INTERVALS; y++)
+                    systemPrintf("%d) %s\r\n", y + 1, mosaicPPSIntervals[y].humanName);
+
+                systemPrintln("x) Abort");
+
+                int interval = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+                if (interval >= 1 && interval <= MAX_MOSAIC_PPS_INTERVALS)
+                {
+                    settings.externalPulseTimeBetweenPulse_us = mosaicPPSIntervals[interval - 1].interval_us;
+                }
+            }
+            else
+            {
+                systemPrint("Time between pulses in milliseconds: ");
+                long pulseTime = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+                if (pulseTime != INPUT_RESPONSE_GETNUMBER_TIMEOUT && pulseTime != INPUT_RESPONSE_GETNUMBER_EXIT)
+                {
+                    if (pulseTime < 1 || pulseTime > 60000) // 60s max
+                        systemPrintln("Error: Time between pulses out of range");
+                    else
+                    {
+                        settings.externalPulseTimeBetweenPulse_us = pulseTime * 1000;
+
+                        if (pulseTime <
+                            (settings.externalPulseLength_us / 1000)) // pulseTime must be longer than pulseLength
+                            settings.externalPulseLength_us = settings.externalPulseTimeBetweenPulse_us /
+                                                              2; // Force pulse length to be 1/2 time between pulses
+                    }
+                }
+            }
+        }
+        else if (incoming == 3 && settings.enableExternalPulse == true)
+        {
+            systemPrint("Pulse length in milliseconds: ");
+            long pulseLength = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+            if (pulseLength != INPUT_RESPONSE_GETNUMBER_TIMEOUT && pulseLength != INPUT_RESPONSE_GETNUMBER_EXIT)
+            {
+                if (pulseLength >
+                    (settings.externalPulseTimeBetweenPulse_us / 1000)) // pulseLength must be shorter than pulseTime
+                    systemPrintln("Error: Pulse length must be shorter than time between pulses");
+                else
+                {
+                    settings.externalPulseLength_us = pulseLength * 1000;
+                }
+            }
+        }
+        else if (incoming == 4 && settings.enableExternalPulse == true)
+        {
+            if (settings.externalPulsePolarity == PULSE_RISING_EDGE)
+                settings.externalPulsePolarity = PULSE_FALLING_EDGE;
+            else
+                settings.externalPulsePolarity = PULSE_RISING_EDGE;
+        }
+        else if (incoming == 5)
+        {
+            settings.enableExternalHardwareEventLogging ^= 1;
+        }
+        else if ((incoming == 6) && (settings.enableExternalHardwareEventLogging == true) && present.gnss_mosaicX5)
+        {
+            settings.externalEventPolarity ^= 1;
+        }
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_EXIT)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#endif  // COMPILE_MENU_PORTS

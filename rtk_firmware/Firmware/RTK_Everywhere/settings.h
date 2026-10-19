@@ -1,0 +1,2730 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+settings.h
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+#ifndef __SETTINGS_H__
+#define __SETTINGS_H__
+
+typedef enum {
+    _bool = 0,
+    _int,
+    _float,
+    _double,
+    _uint8_t,
+    _uint16_t,
+    _uint32_t,
+    _uint64_t,
+    _int8_t,
+    _int16_t,
+    tMuxConn,
+    tSysState,
+    tPulseEdg,
+    tBtRadio,
+    tPerDisp,
+    tCoordInp,
+    tCharArry,
+    _IPString,
+    tUbxMsgRt,
+    tUbxConst,
+    tEspNowPr,
+    tUbMsgRtb,
+    tWiFiNet,
+    tNSCHost,
+    tNSCPort,
+    tNSCUser,
+    tNSCUsrPw,
+    tNSMtPt,
+    tNSMtPtPw,
+
+    tUmMRNmea,
+    tUmMRRvRT,
+    tUmMRBaRT,
+    tUmConst,
+
+    tCorrSPri,
+    tRegCorTp,
+    tMosaicConst,
+    tMosaicMSNmea,
+    tMosaicSINmea,
+    tMosaicMIRvRT,
+    tMosaicMIBaRT,
+    tMosaicMERvRT,
+    tMosaicMEBaRT,
+    tLgMRNmea,
+    tLgMRRvRT,
+    tLgMRBaRT,
+    tLgMRPqtm,
+    tLgConst,
+    tGnssReceiver,
+
+    tCmnCnst,
+    tCmnRtNm,
+    tCnRtRtB,
+    tCnRtRtR,
+
+    tNSCEn,
+
+    // Add new settings types above <---------------->
+    // (Maintain the enum of existing settings types!)
+} RTK_Settings_Types;
+
+#include <LittleFS.h> //Built-in
+
+// Important note: the firmware currently requires SdFat v2.1.1
+// sd->begin will crash second time around with ~v2.2.3
+#include "SdFat.h" //http://librarymanager/All#sdfat_exfat by Bill Greiman.
+
+// Peripherals
+#include "GNSS.h"
+#include "GNSS_None.h"
+#include "GNSS_ZED.h" //Structs of ZED messages, needed for settings.h
+#include "GNSS_UM980.h" //Structs of UM980 messages, needed for settings.h
+#include "GNSS_Mosaic.h" //Structs of mosaic messages, needed for settings.h
+#include "GNSS_LG290P.h" //Structs of LG90P messages, needed for settings.h
+
+#include <vector>
+
+// System can enter a variety of states
+// See statemachine diagram at:
+// https://lucid.app/lucidchart/53519501-9fa5-4352-aa40-673f88ca0c9b/edit?invitationId=inv_ebd4b988-513d-4169-93fd-c291851108f8
+typedef enum
+{
+    STATE_ROVER_NOT_STARTED = 0,        //  0
+    STATE_ROVER_CONFIG_WAIT,            //  1
+    STATE_ROVER_NO_FIX,                 //  2
+    STATE_ROVER_FIX,                    //  3
+    STATE_ROVER_RTK_FLOAT,              //  4
+    STATE_ROVER_RTK_FIX,                //  5
+
+    STATE_BASE_CASTER_NOT_STARTED,      //  6, Set override flag
+    STATE_BASE_ASSIST_NOT_STARTED,      //  7
+    STATE_BASE_NOT_STARTED,             //  8
+    STATE_BASE_CONFIG_WAIT,             //  9
+    STATE_BASE_TEMP_SETTLE,             // 10, User has indicated base, but current pos accuracy is too low
+    STATE_BASE_TEMP_SURVEY_STARTED,     // 11
+    STATE_BASE_TEMP_TRANSMITTING,       // 12
+    STATE_BASE_FIXED_NOT_STARTED,       // 13
+    STATE_BASE_FIXED_TRANSMITTING,      // 14
+
+    STATE_DISPLAY_SETUP,                // 15
+    STATE_WEB_CONFIG_NOT_STARTED,       // 16
+    STATE_WEB_CONFIG_WAIT_FOR_NETWORK,  // 17
+    STATE_WEB_CONFIG,                   // 18
+    STATE_PROFILE,                      // 19
+
+    STATE_KEYS_REQUESTED,               // 20
+
+    STATE_ESPNOW_PAIRING_NOT_STARTED,   // 21
+    STATE_ESPNOW_PAIRING,               // 22
+
+    STATE_NTPSERVER_NOT_STARTED,        // 23
+    STATE_NTPSERVER_NO_SYNC,            // 24
+    STATE_NTPSERVER_SYNC,               // 25
+
+    STATE_SHUTDOWN,                     // 26
+
+    STATE_NOT_SET,                      // 27, Must be last on list
+} SystemState;
+volatile SystemState systemState = STATE_NOT_SET;
+SystemState lastSystemState = STATE_NOT_SET;
+SystemState requestedSystemState = STATE_NOT_SET;
+bool newSystemStateRequested = false;
+
+// Base modes set with RTK_MODE
+#define RTK_MODE_BASE_UNDECIDED     0
+#define RTK_MODE_BASE_FIXED         0x0001  // 1 << 0
+#define RTK_MODE_BASE_SURVEY_IN     0x0002  // 1 << 1
+#define RTK_MODE_NTP                0x0004  // 1 << 2
+#define RTK_MODE_ROVER              0x0008  // 1 << 3
+#define RTK_MODE_TESTING            0x0010  // 1 << 4
+#define RTK_MODE_WEB_CONFIG         0x0020  // 1 << 5
+#define RTK_MODE_MAX                6
+
+typedef uint8_t RtkMode_t;
+
+const char * const rtkModeName[] =
+{
+    "RTK_MODE_BASE_FIXED",
+    "RTK_MODE_BASE_SURVEY_IN",
+    "RTK_MODE_NTP",
+    "RTK_MODE_ROVER",
+    "RTK_MODE_TESTING",
+    "RTK_MODE_WEB_CONFIG",
+};
+const uint8_t rtkModeNameEntries = sizeof(rtkModeName) / sizeof(rtkModeName[0]);
+
+#define RTK_MODE(mode)          rtkMode = mode;
+
+#define EQ_RTK_MODE(mode)       (rtkMode && (rtkMode == (mode & rtkMode)))
+#define NEQ_RTK_MODE(mode)      ((rtkMode == 0) || ((mode & rtkMode) == 0))
+
+// Branding support
+typedef enum {
+    BRAND_SPARKFUN = 0,
+    BRAND_SPARKPNT,
+    // Add new brands above this line
+    BRAND_NUM
+} RTKBrands_e;
+
+#define DEFAULT_BRAND           BRAND_SPARKPNT
+
+typedef struct
+{
+    const RTKBrands_e brand;
+    const char name[9];
+    const uint8_t logoWidth;
+    const uint8_t logoHeight;
+    const uint8_t * const logoPointer;
+} RTKBrandAttribute;
+
+extern const uint8_t logoSparkFun_Height;
+extern const uint8_t logoSparkFun_Width;
+extern const uint8_t logoSparkFun[];
+extern const uint8_t logoSparkPNT_Height;
+extern const uint8_t logoSparkPNT_Width;
+extern const uint8_t logoSparkPNT[];
+extern const uint8_t logoSparkPNT_128x64_Height;
+extern const uint8_t logoSparkPNT_128x64_Width;
+extern const uint8_t logoSparkPNT_128x64[];
+
+RTKBrandAttribute RTKBrandAttributes[RTKBrands_e::BRAND_NUM] = {
+    { BRAND_SPARKFUN, "SparkFun", logoSparkFun_Width, logoSparkFun_Height, logoSparkFun },
+    { BRAND_SPARKPNT, "SparkPNT", logoSparkPNT_Width, logoSparkPNT_Height, logoSparkPNT },
+};
+const int RTKBrandAttributesEntries = sizeof(RTKBrandAttributes) / sizeof(RTKBrandAttributes[0]);
+
+// Product Variant - Do NOT reorder and do NOT remove unused values!!!
+// The label on the product lists the device ID which consists of the
+// Bluetooth address followed by two digits of the ProductVariant below.
+// This same ID value is used for the whitelists.  Skipped values represent
+// unreleased or new products.
+typedef enum
+{
+    RTK_ALL = -1,
+    RTK_EVK = 0, // 0x00
+    // RTK_FACET_V2 = 1, // 0x01 - No L-Band
+    RTK_FACET_MOSAIC = 2, // 0x02
+    RTK_TORCH = 3, // 0x03
+    // RTK_FACET_V2_LBAND = 4, // 0x04
+    RTK_POSTCARD = 5, // 0x05
+    RTK_FACET_FP = 6, // 0x06
+    RTK_TORCH_X2 = 7, // 0x07
+    // Add new values above this line
+    RTK_UNKNOWN
+} ProductVariant;
+ProductVariant productVariant = RTK_UNKNOWN;
+
+// allVariants - Do NOT remove, MUST match the contents of ProductVariant
+// without the RTK_ALL value!!!
+static const ProductVariant allVariants[] = { RTK_EVK, RTK_FACET_MOSAIC, RTK_TORCH, RTK_POSTCARD, RTK_FACET_FP, RTK_TORCH_X2, RTK_UNKNOWN};
+#define productVariantCount (sizeof(allVariants) / sizeof(allVariants[0]))
+
+typedef enum
+{
+    RTK_HOUSING_EVK = 0,    // EVK with SPK6615H
+    RTK_HOUSING_FACET,      // Facet mosaic-X5
+    RTK_HOUSING_FP,         // Facet FP - tilt possible
+    RTK_HOUSING_POSTCARD,   // Postcard with SPK-6E helical
+    RTK_HOUSING_TORCH,      // Torch - with tilt
+    RTK_HOUSING_TX2,        // Torch X2 - no tilt
+    // Add new housing variants above this line
+    RTK_HOUSING_MAX_NONE,
+} ProductVariantHousing;
+
+typedef struct
+{
+    const ProductVariantHousing housing;
+    const float antennaPhaseCenter_mm;
+    const bool tiltPossible;
+    const char *leverArm;
+    const char *installAngle;
+    const char *gnssCard;
+} productHousingProperties;
+
+const productHousingProperties productHousingPropertiesTable[] =
+{
+    {RTK_HOUSING_EVK,       42.0,   false,  "", "", ""}, // Default to NGS calibrated SPK6615H APC, average of L1/L2
+    {RTK_HOUSING_FACET,     68.5,   false,  "", "", ""}, // Default to L-Band element APC, average of L1/L2
+    {RTK_HOUSING_FP,        58.3,   true,   "LEVER_ARM2=0.03391,0.00272,0.02370", "INSTALL_ANGLE=0,180,0", "GNSS_CARD=OEM"}, // NGS calibrated average of L1/L2
+    {RTK_HOUSING_POSTCARD,  37.5,   false,  "", "", ""}, // APC of SPK-6E helical L1/L2/L5 antenna
+    {RTK_HOUSING_TORCH,     129.0,  true,   "LEVER_ARM=-0.00678,-0.01073,-0.0314", "", "GNSS_CARD=UNICORE"}, // Default to Torch helical APC, NGS calibrated average of L1/L2
+    {RTK_HOUSING_TX2,       129.0,  false,  "", "", ""}, // Default to Torch helical APC, NGS calibrated average of L1/L2
+    {RTK_HOUSING_MAX_NONE,  0.0,    false,  "", "", ""},
+};
+const int productHousingEntries = sizeof(productHousingPropertiesTable) / sizeof(productHousingPropertiesTable[0]);
+
+typedef enum
+{
+    TILT_NOT_PRESENT = 0,
+    TILT_DISABLED,
+    TILT_OFFLINE,
+    TILT_STARTED,
+    TILT_INITIALIZED,
+    TILT_CORRECTING,
+    TILT_REQUEST_STOP,
+} TiltState;
+
+// Product Properties Table
+// ========================
+// name is used to create the BT broadcast deviceName
+// It is formed from: the brand, the name, the 6-character serial number (two MAC octets plus productVariant)
+// Limit name to 12 chars max - to keep the total broadcast length to 28 chars or less
+// E.g.: "SparkPNT Facet v2 LB-ABCD04" is 27 chars
+// SparkPNT Facet FP-ABCD06
+// SparkPNT Torch X2-ABCD07
+// name is also used to create the title for the menus etc.. Include "RTK" if rtkPrefix is true
+// displayName is displayed on the OLED. Keep short - and adjust to match the width of the OLED
+// filePrefix is the settings and log file prefix
+// platformProvision is assembled into the PointPerfect ZTP request (largely deprecated)
+// If rtkPrefix is true, "RTK" is included before the name: on the OLED, in the serial menus, etc.
+// productPlanUID is a 16 character unique identifier for the product plan associated with the MFi accessory
+// defaultSystemState is the default system state - if the actual previous state is unknown
+// platformRegistration is the web page for product registration
+typedef struct
+{
+    ProductVariant productVariant;
+    const float r1; // First resistor value in K Ohms, zero = no resistor
+    const float r2; // Second resistor value in K OHms, zero = no resistor
+    const float tolerancePercentage;  // Resistor tolerance
+    const RTKBrands_e brand;
+    const ProductVariantHousing housing;
+    const char *name;
+    const char *displayName;
+    const char *filePrefix;
+    const char *platformProvision;
+    const bool rtkPrefix;
+    const char *productPlanUID;
+    const SystemState defaultSystemState;
+    const char *platformRegistration;
+} productProperties;
+
+const productProperties productPropertiesTable[] =
+{
+    //productVariant    r1    r2    Tol %   brand           housing                 name            displayName filePrefix              platformProvision   rtkPfx  productPlanUID      defaultSystemState          platformRegistration
+    //==============    ==    ==    =====   =====           =======                 ====            =========== ==========              =================   ======  ==============      ==================          ====================
+    { RTK_EVK,          1,    10,   17.5,   BRAND_SPARKFUN, RTK_HOUSING_EVK,        "EVK",          "EVK",      "SFE_EVK",              "EVK",              true,   "0000000000000000", STATE_ROVER_NOT_STARTED,    "https://www.sparkfun.com/rtk_evk_registration" },
+    { RTK_FACET_MOSAIC, 1,    4.7,  10,     BRAND_SPARKPNT, RTK_HOUSING_FACET,      "Facet X5",     "Facet X5", "SFE_Facet_mosaic",     "Facet mosaicX5",   true,   "0000000000000000", STATE_ROVER_NOT_STARTED,    "https://www.sparkfun.com/rtk_facet_mosaic_registration" },
+    { RTK_TORCH,        0,    0,    0,      BRAND_SPARKPNT, RTK_HOUSING_TORCH,      "Torch",        "Torch",    "SFE_Torch",            "Torch",            true,   "0000000000000000", STATE_ROVER_NOT_STARTED,    "https://www.sparkfun.com/rtk_torch_registration" },
+    { RTK_POSTCARD,     3.3,  10,   8.5,    BRAND_SPARKFUN, RTK_HOUSING_POSTCARD,   "Postcard",     "Postcard", "SFE_Postcard",         "Postcard",         true,   "e9e877bb278140f0", STATE_ROVER_NOT_STARTED,    "https://www.sparkfun.com/rtk_postcard_registration" },
+    { RTK_FACET_FP,     10,   20,   8.5,    BRAND_SPARKPNT, RTK_HOUSING_FP,         "FP",           "FP",       "SFE_FP",               "FP",               false,  "e9e877bb278140f0", STATE_ROVER_NOT_STARTED,    "https://www.sparkfun.com/rtk_facet_fp_registration" },
+    { RTK_TORCH_X2,     8.2,  3.3,  8.5,    BRAND_SPARKPNT, RTK_HOUSING_TX2,        "TX2",          "TX2",      "SFE_TX2",              "TX2",              false,  "3407c7ca3d6b4984", STATE_ROVER_NOT_STARTED,    "https://www.sparkfun.com/tx2_registration" },
+    { RTK_UNKNOWN,      0,    0,    0,      DEFAULT_BRAND,  RTK_HOUSING_MAX_NONE,   "Unknown",      "Unknown",  "SFE_Unknown",          "Unknown",          true,   "0000000000000000", STATE_ROVER_NOT_STARTED,    "Unknown" },
+};
+const int productPropertiesEntries = sizeof(productPropertiesTable) / sizeof(productPropertiesTable[0]);
+
+#define productVariantProperties getProductPropertiesFromVariant(productVariant)
+#define variantHousingProperties getProductHousingPropertiesFromVariant(productVariant)
+
+// Corrections Priority
+typedef enum
+{
+    // Change the order of these to set the default priority. First (0) is highest
+    CORR_RADIO_EXT = 0, // 0, 100 m Baseline, Data goes direct from RADIO connector to ZED - or X5. How to disable / enable it? Via port protocol?
+    CORR_ESPNOW,        // 1, 100 m Baseline, ESPNOW.ino
+    CORR_RADIO_LORA,    // 2,   1 km Baseline, Torch goes via ESP32, Facet FP goes via SW4 to GNSS
+    CORR_BLUETOOTH,     // 3,  10+km Baseline, Tasks.ino (sendGnssBuffer)
+    CORR_USB,           // 4,                  menuMain.ino (terminalUpdate)
+    CORR_TCP,           // 5,  10+km Baseline, NtripClient.ino
+    CORR_PPP_HAS_B2B,   // 6, 100+km Baseline
+    CORR_LBAND,         // 7, 100 km Baseline, menuPP.ino for PMP - PointPerfectLibrary.ino for PPL
+    CORR_IP,            // 8, 100+km Baseline, MQTT_Client.ino
+    // Add new correction sources just above this line
+    CORR_NUM
+} correctionsSource;
+
+typedef uint8_t CORRECTION_ID_T;    // Type holding a correction ID or priority
+typedef uint16_t CORRECTION_MASK_T;  // Type holding a bitmask of correction IDs
+
+const char * const correctionsSourceNames[CORR_NUM] =
+{
+    // These must match correctionsSource above
+    "External Radio",
+    "ESP-NOW",
+    "LoRa Radio",
+    "Bluetooth",
+    "USB Serial",
+    "TCP (NTRIP)",
+    "PPP HAS/B2b",
+    "L-Band",
+    "IP (PointPerfect/MQTT)",
+    // Add new correction sources just above this line
+};
+const int correctionsSourceNamesEntries = sizeof(correctionsSourceNames) / sizeof(correctionsSourceNames[0]);
+
+// Base mode - outgoing correction broadcast methods
+// Used by Display.ino to show which method(s) are currently transmitting corrections
+typedef enum
+{
+    BCAST_ESPNOW = 0,   // ESPNOW.ino
+    BCAST_RADIO_LORA,   // LoRa.ino
+    BCAST_NTRIP_SERVER, // NtripServer.ino
+    BCAST_NTRIP_CASTER, // TcpServer.ino
+    // Add new broadcast methods just above this line
+    BCAST_NUM
+} broadcastSource;
+
+typedef uint8_t BCAST_ID_T; // Type holding a broadcast method ID
+
+// Setup Buttons
+typedef struct
+{
+    const char *name;
+    SystemState newState;
+    uint8_t newProfile; // Only valid when newState == STATE_PROFILE
+} setupButton;
+
+// OLED Displays
+typedef enum
+{
+    DISPLAY_64x48,
+    DISPLAY_128x64,
+    DISPLAY_184x88, // Facet FP e-Paper (SSD168x via I2C-SPI bridge)
+    // Add new displays above this line
+    DISPLAY_MAX_NONE // This represents the maximum numbers of display and also "no display"
+} DisplayType;
+
+const uint8_t DisplayWidth[DISPLAY_MAX_NONE] = { 64, 128, 184 }; // We could get these from the oled, but this is const
+const uint8_t DisplayHeight[DISPLAY_MAX_NONE] = { 48, 64, 88 };
+
+typedef enum
+{
+    BUTTON_ROVER = 0,
+    BUTTON_BASE,
+} ButtonState;
+ButtonState buttonPreviousState = BUTTON_ROVER;
+
+// Data port mux (RTK Facet) can enter one of four different connections
+typedef enum
+{
+    MUX_GNSS_UART = 0,
+    MUX_PPS_EVENTTRIGGER,
+    MUX_I2C_WT,
+    MUX_ADC_DAC,
+} muxConnectionType_e;
+
+// User can enter fixed base coordinates in ECEF or degrees
+typedef enum
+{
+    COORD_TYPE_ECEF = 0,
+    COORD_TYPE_GEODETIC,
+} coordinateType_e;
+
+// User can select output pulse as either falling or rising edge
+typedef enum
+{
+    PULSE_FALLING_EDGE = 0,
+    PULSE_RISING_EDGE,
+} pulseEdgeType_e;
+
+// Custom NMEA sentence types output to the log file
+typedef enum
+{
+    CUSTOM_NMEA_TYPE_RESET_REASON = 0,
+    CUSTOM_NMEA_TYPE_WAYPOINT,
+    CUSTOM_NMEA_TYPE_EVENT,
+    CUSTOM_NMEA_TYPE_SYSTEM_VERSION,
+    CUSTOM_NMEA_TYPE_ZED_VERSION,
+    CUSTOM_NMEA_TYPE_STATUS,
+    CUSTOM_NMEA_TYPE_DEVICE_BT_ID,
+    CUSTOM_NMEA_TYPE_PARSER_STATS,
+    CUSTOM_NMEA_TYPE_CURRENT_DATE,
+    CUSTOM_NMEA_TYPE_ARP_ECEF_XYZH,
+    CUSTOM_NMEA_TYPE_GNSS_UNIQUE_ID,
+} customNmeaType_e;
+
+// Freeze and blink LEDs if we hit a bad error
+typedef enum
+{
+    ERROR_NO_I2C = 2, // Avoid 0 and 1 as these are bad blink codes
+    ERROR_GPS_CONFIG_FAIL,
+} t_errorNumber;
+
+// User can select different PPP modes
+// LG290P has 0/1/2/255, UM980 has enable/disable
+enum
+{
+    PPP_MODE_DISABLE = 0,
+    PPP_MODE_B2B, // 1
+    PPP_MODE_HAS, // 2
+    PPP_MODE_AUTO = 255
+};
+
+// Define the periodic display values
+typedef uint64_t PeriodicDisplay_t;
+
+enum PeriodDisplayValues
+{
+    PD_BLUETOOTH_DATA_RX = 0,   //  0
+    PD_BLUETOOTH_DATA_TX,       //  1
+
+    PD_IP_ADDRESS,              //  2
+    PD_ETHERNET_STATE,          //  3
+
+    PD_NETWORK_STATE,           //  4
+
+    PD_NTP_SERVER_DATA,         //  5
+    PD_NTP_SERVER_STATE,        //  6
+
+    PD_NTRIP_CLIENT_DATA,       //  7
+    PD_NTRIP_CLIENT_GGA,        //  8
+    PD_NTRIP_CLIENT_STATE,      //  9
+
+    PD_NTRIP_SERVER_DATA,       // 10
+    PD_NTRIP_SERVER_STATE,      // 11
+
+    PD_TCP_CLIENT_DATA,         // 12
+    PD_TCP_CLIENT_STATE,        // 13
+
+    PD_TCP_SERVER_DATA,         // 14
+    PD_TCP_SERVER_STATE,        // 15
+    PD_TCP_SERVER_CLIENT_DATA,  // 16
+
+    PD_UDP_SERVER_DATA,         // 17
+    PD_UDP_SERVER_STATE,        // 18
+    PD_UDP_SERVER_BROADCAST_DATA,  // 19
+
+    PD_RING_BUFFER_MILLIS,      // 20
+
+    PD_SD_LOG_WRITE,            // 21
+
+    PD_TASK_BLUETOOTH_READ,     // 22
+    PD_TASK_BUTTON_CHECK,       // 23
+    PD_TASK_GNSS_READ,          // 24
+    PD_TASK_HANDLE_GNSS_DATA,   // 25
+    PD_TASK_SD_SIZE_CHECK,      // 26
+    PD_TASK_UPDATE_PPL,         // 27
+
+    PD_CELLULAR_STATE,          // 28
+    PD_WIFI_STATE,              // 29
+
+    PD_GNSS_DATA_RX,            // 30
+    PD_GNSS_DATA_TX,            // 31
+
+    PD_MQTT_CLIENT_DATA,        // 32
+    PD_MQTT_CLIENT_STATE,       // 33
+
+    PD_TASK_UPDATE_WEBSERVER,   // 34
+
+    PD_HTTP_CLIENT_STATE,       // 35
+
+    PD_PROVISIONING_STATE,      // 36
+
+    PD_CORRECTION_SOURCE,       // 37
+
+    PD_GNSS_DATA_RX_BYTE_COUNT, // 38
+
+    PD_WEB_SERVER_STATE,        // 39
+
+    PD_OTA_STATE,               // 40
+
+    PD_FIRMWARE_MODE,           // 41
+    // Add new values before this line
+};
+
+#define PERIODIC_MASK(x) (1ull << x)
+#define PERIODIC_DISPLAY(x) (periodicDisplay & PERIODIC_MASK(x))
+#define PERIODIC_CLEAR(x) periodicDisplay = periodicDisplay & ~PERIODIC_MASK(x)
+#define PERIODIC_SETTING(x) (settings.periodicDisplay & PERIODIC_MASK(x))
+#define PERIODIC_TOGGLE(x) settings.periodicDisplay = settings.periodicDisplay ^ PERIODIC_MASK(x)
+
+typedef enum
+{
+    ESPNOW_OFF = 0,
+    ESPNOW_BROADCASTING,
+    ESPNOW_PAIRING,
+    ESPNOW_MAC_RECEIVED,
+    ESPNOW_PAIRED,
+    ESPNOW_MAX
+} ESPNOWState;
+
+const uint8_t ESPNOW_MAX_PEERS = 5; // Maximum of 5 rovers
+
+typedef enum
+{
+    BLUETOOTH_RADIO_SPP = 0,
+    BLUETOOTH_RADIO_BLE,
+    BLUETOOTH_RADIO_SPP_AND_BLE,
+    BLUETOOTH_RADIO_OFF,
+} BluetoothRadioType_e;
+
+#define SSID_LENGTH     50
+#define PASSWORD_LENGTH 50
+
+typedef struct WiFiNetwork
+{
+    char ssid[SSID_LENGTH];
+    char password[PASSWORD_LENGTH];
+} WiFiNetwork;
+
+#define MAX_WIFI_NETWORKS 4
+
+typedef uint16_t RING_BUFFER_OFFSET;
+
+// Radio status LED goes from off (LED off), no connection (blinking), to connected (solid)
+typedef enum
+{
+    BT_OFF = 0,
+    BT_NOTCONNECTED,
+    BT_CONNECTED,
+} BTState;
+
+// Return values for getUserInputString()
+typedef enum
+{
+    INPUT_RESPONSE_GETNUMBER_EXIT =
+        -9999999, // Less than min ECEF. User may be prompted for number but wants to exit without entering data
+    INPUT_RESPONSE_GETNUMBER_TIMEOUT = -9999998,
+    INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT = 255,
+    INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY = 254,
+    INPUT_RESPONSE_INVALID = -4,
+    INPUT_RESPONSE_TIMEOUT = -3,
+    INPUT_RESPONSE_OVERFLOW = -2,
+    INPUT_RESPONSE_EMPTY = -1,
+    INPUT_RESPONSE_VALID = 1,
+} InputResponse;
+
+typedef enum
+{
+    PRINT_ENDPOINT_SERIAL = 0,
+    PRINT_ENDPOINT_TCP_SERVER,
+    PRINT_ENDPOINT_BLUETOOTH,
+    PRINT_ENDPOINT_BLUETOOTH_COMMAND,
+    PRINT_ENDPOINT_ALL,
+    PRINT_ENDPOINT_COUNT_COMMANDS,
+} PrintEndpoint;
+PrintEndpoint printEndpoint = PRINT_ENDPOINT_SERIAL; // Controls where the configuration menu data gets printed to
+PrintEndpoint readEndpoint = PRINT_ENDPOINT_SERIAL; // Controls where data for the configuration menu is read from
+
+typedef enum
+{
+    ZTP_NOT_STARTED = 0,
+    ZTP_SUCCESS,
+    ZTP_DEACTIVATED,
+    ZTP_NOT_WHITELISTED,
+    ZTP_ALREADY_REGISTERED,
+    ZTP_UNKNOWN_ERROR,
+} ZtpResponse;
+
+typedef enum
+{
+    FUNCTION_NOT_SET = 0,
+    FUNCTION_SYNC,
+    FUNCTION_WRITESD,
+    FUNCTION_FILESIZE,
+    FUNCTION_EVENT,
+    FUNCTION_BEGINSD,
+    FUNCTION_RECORDSETTINGS,
+    FUNCTION_LOADSETTINGS,
+    FUNCTION_MARKEVENT,
+    FUNCTION_GETLINE,
+    FUNCTION_REMOVEFILE,
+    FUNCTION_RECORDLINE,
+    FUNCTION_CREATEFILE,
+    FUNCTION_ENDLOGGING,
+    FUNCTION_FINDLOG,
+    FUNCTION_FILELIST,
+    FUNCTION_FILEMANAGER_OPEN1,
+    FUNCTION_FILEMANAGER_OPEN2,
+    FUNCTION_FILEMANAGER_OPEN3,
+    FUNCTION_FILEMANAGER_UPLOAD1,
+    FUNCTION_FILEMANAGER_UPLOAD2,
+    FUNCTION_FILEMANAGER_UPLOAD3,
+    FUNCTION_FILEMANAGER_DOWNLOAD1,
+    FUNCTION_FILEMANAGER_DOWNLOAD2,
+    FUNCTION_SDSIZECHECK,
+    FUNCTION_LOG_CLOSURE,
+    FUNCTION_PRINT_FILE_LIST,
+    FUNCTION_NTPEVENT,
+    FUNCTION_ARPWRITE,
+    FUNCTION_FILE_EXISTS,
+    FUNCTION_FILE_DUMP,
+} SemaphoreFunction;
+
+// Print the base coordinates in different formats, depending on the type the user has entered
+// These are the different supported types
+// Note: COORDINATE_INPUT_TYPE_DDDMM is needed by coordinateConvertInput for longitude only.
+//       coordinateIdentifyInputType will return COORDINATE_INPUT_TYPE_DDMM for both
+//       5-digit longitude and 4-digit latitude.
+typedef enum
+{
+    COORDINATE_INPUT_TYPE_DD = 0,                   // Default DD.ddddddddd
+    COORDINATE_INPUT_TYPE_DDMM,                     // DDMM.mmmmm
+    COORDINATE_INPUT_TYPE_DDDMM,                    // DDDMM.mmmmm - coordinateConvertInput longitude only
+    COORDINATE_INPUT_TYPE_DD_MM,                    // DD MM.mmmmm
+    COORDINATE_INPUT_TYPE_DD_MM_DASH,               // DD-MM.mmmmm
+    COORDINATE_INPUT_TYPE_DD_MM_SYMBOL,             // DD°MM.mmmmmmm'
+    COORDINATE_INPUT_TYPE_DDMMSS,                   // DD MM SS.ssssss
+    COORDINATE_INPUT_TYPE_DD_MM_SS,                 // DD MM SS.ssssss
+    COORDINATE_INPUT_TYPE_DD_MM_SS_DASH,            // DD-MM-SS.ssssss
+    COORDINATE_INPUT_TYPE_DD_MM_SS_SYMBOL,          // DD°MM'SS.ssssss"
+    COORDINATE_INPUT_TYPE_DDMMSS_NO_DECIMAL,        // DDMMSS - No decimal
+    COORDINATE_INPUT_TYPE_DD_MM_SS_NO_DECIMAL,      // DD MM SS - No decimal
+    COORDINATE_INPUT_TYPE_DD_MM_SS_DASH_NO_DECIMAL, // DD-MM-SS - No decimal
+    COORDINATE_INPUT_TYPE_INVALID_UNKNOWN,
+} CoordinateInputType;
+
+// Responses for updateSettingWithValue() and getSettingValue() used in the CLI
+typedef enum
+{
+    SETTING_UNKNOWN = 0,
+    SETTING_KNOWN,
+    SETTING_KNOWN_STRING,
+    SETTING_KNOWN_READ_ONLY,
+    SETTING_KNOWN_WEB_CONFIG_INTERFACE_ELEMENT,
+} SettingValueResponse;
+
+#define INCHES_IN_A_METER   39.37007874
+#define FEET_IN_A_METER     3.280839895
+
+typedef enum
+{
+    MEASUREMENT_UNITS_METERS = 0,
+    MEASUREMENT_UNITS_FEET_INCHES,
+    // Add new measurement units above this line
+    MEASUREMENT_UNITS_MAX
+} measurementUnits;
+
+typedef struct
+{
+    const measurementUnits measurementUnit;
+    const char *measurementScaleName;
+    const char *measurementScale1NameShort;
+    const char *measurementScale2NameShort;
+    const double multiplierMetersToScale1;
+    const double changeFromScale1To2At;
+    const double multiplierScale1To2;
+    const double reportingLimitScale1;
+} measurementScaleEntry;
+
+const measurementScaleEntry measurementScaleTable[] = {
+    { MEASUREMENT_UNITS_METERS, "meters", "m", "m", 1.0, 1.0, 1.0, 30.0 },
+    { MEASUREMENT_UNITS_FEET_INCHES, "feet and inches", "ft", "in", FEET_IN_A_METER, 3.0, 12.0, 100.0 }
+};
+const int measurementScaleEntries = sizeof(measurementScaleTable) / sizeof(measurementScaleTable[0]);
+
+// Regional Support
+// Some regions have both L-Band and IP. More just have IP.
+// Do we want the user to be able to specify which region they are in?
+// Or do we want to figure it out based on position?
+// If we define a simple 'square' area for each region, we can do both.
+// Note: the best way to obtain the L-Band frequencies would be from the MQTT /pp/frequencies/Lb topic.
+//       But it is easier to record them here, in case we don't have access to MQTT...
+// Note: the key distribution topic is provided during ZTP. We don't need to record it here.
+
+typedef struct
+{
+    const double latNorth; // Degrees
+    const double latSouth; // Degrees
+    const double lonEast; // Degrees
+    const double lonWest; // Degrees
+} Regional_Area;
+
+typedef struct
+{
+    const char *name; // As defined in the ZTP subscriptions description: EU, US, KR, AU, Japan
+    const char *topicRegion; // As used in the corrections topic path
+    const Regional_Area area;
+    const uint32_t frequency; // L-Band frequency, Hz, if supported. 0 if not supported
+} Regional_Information;
+
+const Regional_Information Regional_Information_Table[] =
+{
+    { "US", "us", { 50.0,  25.0, -60.0, -125.0}, 1556290000 },
+    { "EU", "eu", { 72.0,  36.0,  32.0,  -11.0}, 1545260000 },
+    { "AU", "au", {-25.0, -45.0, 154.0,  113.0}, 0 },
+    { "KR", "kr", { 39.0,  34.0, 129.5,  125.0}, 0 },
+    { "Japan", "jp", { 46.0,  31.0, 146.0,  129.5}, 0 },
+};
+const int numRegionalAreas = sizeof(Regional_Information_Table) / sizeof(Regional_Information_Table[0]);
+
+#define NTRIP_SERVER_STRING_SIZE        50
+
+// Bitfield for describing the network consumers
+enum
+{
+    NETCONSUMER_HTTP_CLIENT = 0,
+    NETCONSUMER_NTP_SERVER,
+    NETCONSUMER_NTRIP_CLIENT,
+    NETCONSUMER_NTRIP_SERVER,
+    NETCONSUMER_NTRIP_SERVER_0 = NETCONSUMER_NTRIP_SERVER,
+    NETCONSUMER_NTRIP_SERVER_1,
+    NETCONSUMER_NTRIP_SERVER_2,
+    NETCONSUMER_NTRIP_SERVER_3,
+    NETCONSUMER_NTRIP_SERVER_MAX = NETCONSUMER_NTRIP_SERVER + NTRIP_SERVER_MAX,
+    NETCONSUMER_OTA_CLIENT = NETCONSUMER_NTRIP_SERVER_MAX,
+    NETCONSUMER_POINTPERFECT_KEY_UPDATE,
+    NETCONSUMER_POINTPERFECT_MQTT_CLIENT,
+    NETCONSUMER_TCP_CLIENT,
+    NETCONSUMER_TCP_SERVER,
+    NETCONSUMER_UDP_SERVER,
+    NETCONSUMER_WEB_CONFIG,
+    NETCONSUMER_DEVICE_OTA,
+    // Add new consumers just before this line
+    // Also add them to the networkConsumerTable
+    NETCONSUMER_MAX
+};
+
+typedef uint8_t NETCONSUMER_t;
+typedef uint16_t NETCONSUMER_MASK_t;
+
+enum PP_NickName
+{
+    PP_NICKNAME_DISABLED = 0,
+    PP_NICKNAME_FLEX_RTCM, // 1
+    //PP_NICKNAME_FLEX_LBAND_NA, // 2
+    PP_NICKNAME_GLOBAL, // 3
+    PP_NICKNAME_LIVE, // 4
+    PP_NICKNAME_IP_MQTT, // 5
+    PP_NICKNAME_MAX, // 6
+};
+
+// This is all the settings that can be set on RTK Product. It's recorded to NVM and the config file.
+// Avoid reordering. The order of these variables is mimicked in NVM/record/parse/create/update/get
+struct Settings
+{
+    int sizeOfSettings = 0;             // sizeOfSettings **must** be the first entry and must be int
+    int rtkIdentifier = RTK_IDENTIFIER; // rtkIdentifier **must** be the second entry
+
+    // CRC control, old files missing this value use false, new file write true
+    bool settingsFileHasCrc = false;    // settingsFileHasCrc **must** be the third entry
+
+    //Once we detect the platform or receiver, no need to re-detect
+    //ProductVariant previouslyDetectedPlatform = RTK_UNKNOWN; //Because LFS is started after deviceID, this is mute
+    gnssReceiverType_e detectedGnssReceiver = GNSS_RECEIVER_UNKNOWN;
+
+    // Antenna
+    int16_t antennaHeight_mm = 1800;    // Aka Pole length
+    float antennaPhaseCenter_mm = 0.0;  // Aka ARP
+    uint16_t ARPLoggingInterval_s = 10; // Log the ARP every 10 seconds - if available
+    bool enableARPLogging = false;      // Log the Antenna Reference Position from RTCM 1005/1006 - if available
+
+    // Base operation
+    CoordinateInputType coordinateInputType = COORDINATE_INPUT_TYPE_DD; // Default DD.ddddddddd
+    double fixedAltitude = 1560.089; // m
+    bool fixedBase = false;                  // Use survey-in by default
+    bool fixedBaseCoordinateType = COORD_TYPE_ECEF;
+    double fixedEcefX = -1280206.568;
+    double fixedEcefY = -4716804.403;
+    double fixedEcefZ = 4086665.484;
+    double fixedLat = 40.09029479;
+    double fixedLong = -105.18505761;
+    int observationSeconds = 60;             // Default survey in time of 60 seconds
+    float observationPositionAccuracy = 5.0; // Default survey in pos accy of 5m
+    float surveyInStartingAccuracy = 1.0; // Wait for this horizontal positional accuracy in meters before starting survey in
+    // Use MSM7 over MSM4: on platforms where that is possible and where it requires parameter selection
+    // Needed on:
+    //   LG290P (PQTMCFGRTCM)
+    // Not needed on:
+    //   mosaic-X5 (it has MSM4 and MSM7 message groups)
+    //   ZED (it has separate messages for MSM4 vs. MSM7)
+    //   UM980 (it has separate messages for MSM4 vs. MSM7)
+    bool useMSM7 = false;
+    int rtcmMinElev = -90; // LG290P - minimum elevation for RTCM (PQTMCFGRTCM)
+
+    // Battery
+    bool enablePrintBatteryMessages = true;
+    uint32_t shutdownNoChargeTimeoutMinutes = 0; // If > 0, shut down unit after timeout if not charging
+
+    // Beeper
+    bool enableBeeper = true; // Some platforms have an audible notification
+
+    // Bluetooth
+    double accessoryTimeOffset_s = -1.0; // Apply this offset to EA NMEA data via utcAdjust
+    BluetoothRadioType_e bluetoothRadioType = BLUETOOTH_RADIO_SPP_AND_BLE;
+    bool clearBtPairings = true; // Clear MFi Accessory SSP pairings
+    char eaProtocol[50] = "com.sparkfun.rtk"; // MFi External Accessory protocol name
+    uint16_t sppRxQueueSize = 512 * 4;
+    uint16_t sppTxQueueSize = 32;
+
+    // Corrections
+    int correctionsSourcesLifetime_s = 30; // Expire a corrections source if no data is seen for this many seconds
+    CORRECTION_ID_T correctionsSourcesPriority[CORR_NUM] = { (CORRECTION_ID_T)-1 }; // -1 indicates array is uninitialized, indexed by correction source ID
+    bool debugCorrections = false;
+    uint8_t enableExtCorrRadio = 254; // Will be initialized to true or false depending on model
+
+    // Display
+    bool enableResetDisplay = false;
+
+    // ESP Now
+    bool debugEspNow = false;
+    bool enableEspNow = false;
+    uint8_t espnowPeerCount = 0;
+    uint8_t espnowPeers[ESPNOW_MAX_PEERS][6] = {0}; // Contains the MAC addresses (6 bytes) of paired units
+
+    // Ethernet
+    bool enablePrintEthernetDiag = false;
+    bool ethernetDHCP = true;
+    IPAddress ethernetDNS = {194, 168, 4, 100};
+    IPAddress ethernetGateway = {192, 168, 0, 1};
+    IPAddress ethernetIP = {192, 168, 0, 123};
+    IPAddress ethernetSubnet = {255, 255, 255, 0};
+
+    // Firmware
+    uint32_t autoFirmwareCheckMinutes = 24 * 60;
+    bool debugFirmwareUpdate = false;
+    bool enableAutoFirmwareUpdate = false;
+    char csvUrl[OTA_FIRMWARE_CSV_URL_LENGTH] = OTA_FIRMWARE_CSV_URL;
+    // otaDeveloperOptions is NOT a member here - it must never be sticky/NVM (see otaDeveloperOptions global below)
+    uint8_t otaRequestEsp32 = 0; // OTA_REQUEST_PRODUCT_RELEASE
+    uint8_t otaRequestGnss = 0;
+    uint8_t otaRequestLora = 0;
+    uint8_t otaRequestImu = 0;
+
+    // GNSS
+    muxConnectionType_e dataPortChannel = MUX_GNSS_UART; // Mux default to GNSS UART
+    bool debugGnss = false;                          // Turn on to display GNSS library debug messages
+    bool enablePrintPosition = false;
+    uint16_t measurementRateMs = 250;       // Elapsed ms between GNSS measurements. 25ms to 65535ms. Default 4Hz.
+
+    // GNSS UART
+    uint16_t serialGNSSRxFullThreshold = 50; // RX FIFO full interrupt. Max of ~128. See pinUART2Task().
+    int uartReceiveBufferSize = 1024 * 2; // This buffer is filled automatically as the UART receives characters
+
+    // Hardware
+    uint32_t defaultDoubleTapInterval_ms = 250;
+    bool enableExternalHardwareEventLogging = false; // Log when INT/TM2 pin goes low
+    uint16_t spiFrequency = 16;                      // By default, use 16MHz SPI
+
+    // HTTP
+    bool debugHttpClientData = false;  // Debug the HTTP Client (ZTP) data flow
+    bool debugHttpClientState = false; // Debug the HTTP Client state machine
+
+    // IMU
+    bool detectedTilt = false;
+    bool testedTilt = false;
+
+    // Log file
+    bool alignedLogFiles = false; // If true, align log files as per #630
+    bool enableLogging = true;    // If an SD card is present, log default sentences
+    bool enablePrintLogFileMessages = false;
+    bool enablePrintLogFileStatus = true;
+    int maxLogLength_minutes = 60 * 24; // Default to 24 hours
+    int maxLogTime_minutes = 60 * 24;   // Default to 24 hours
+
+    // MQTT
+    bool debugMqttClientData = false;  // Debug the MQTT SPARTAN data flow
+    bool debugMqttClientState = false; // Debug the MQTT state machine
+
+    // Multicast DNS
+    bool mdnsEnable = true; // Allows locating of device from browser address 'rtk.local'
+    char mdnsHostName[50] = "rtk";
+
+    // Network layer
+    bool debugAppleAccessory = false;  // Enable debugging of the AppleAccessory
+    bool debugNetworkLayer = false;    // Enable debugging of the network layer
+    bool printNetworkStatus = true;    // Print network status (delays, failovers, IP address)
+    // networkClient _timeout in ms (lib default is 3000). This limits write glitches to about 3.4s
+    uint32_t networkClientWriteTimeout_ms = 250;
+
+    // NTP
+    bool debugNtp = false;
+    bool enableNTPFile = false;  // Log NTP requests to file
+    uint16_t ethernetNtpPort = 123;
+    uint8_t ntpPollExponent = 6; // NTPpacket::defaultPollExponent 2^6 = 64 seconds
+    int8_t ntpPrecision = -20;   // NTPpacket::defaultPrecision 2^-20 = 0.95us
+    char ntpReferenceId[5] = {'G', 'P', 'S', 0,
+                              0}; // NTPpacket::defaultReferenceId. Ref ID is 4 chars. Add one extra for a NULL.
+    uint32_t ntpRootDelay = 0;   // NTPpacket::defaultRootDelay = 0. ntpRootDelay is defined in microseconds.
+                                 // ntpProcessOneRequest will convert it to seconds and fraction.
+    uint32_t ntpRootDispersion =
+        1000; // NTPpacket::defaultRootDispersion 1007us = 2^-16 * 66. ntpRootDispersion is defined in microseconds.
+              // ntpProcessOneRequest will convert it to seconds and fraction.
+
+    // NTRIP Client
+    bool debugNtripClientRtcm = false;
+    bool debugNtripClientState = false;
+    bool enableNtripClient = false;
+    char ntripClient_CasterHost[50] = "rtk2go.com"; // It's free...
+    uint16_t ntripClient_CasterPort = 2101;
+    char ntripClient_CasterUser[50] =
+        "test@test.com"; // Some free casters require auth. User must provide their own email address to use RTK2Go
+    char ntripClient_CasterUserPW[50] = "";
+    char ntripClient_MountPoint[50] = "bldr_SparkFun1";
+    char ntripClient_MountPointPW[50] = "";
+    bool ntripClient_TransmitGGA = true;
+
+    // NTRIP Server
+    bool debugNtripServerRtcm = false;
+    bool debugNtripServerState = false;
+    bool enableNtripServer = false;
+    bool enableRtcmMessageChecking = false;
+    bool ntripServer_CasterEnabled[NTRIP_SERVER_MAX] =
+    {
+        false,
+        false,
+        false,
+        false,
+    };
+    char ntripServer_CasterHost[NTRIP_SERVER_MAX][NTRIP_SERVER_STRING_SIZE] = // It's free...
+    {
+        "rtk2go.com",
+        "",
+        "",
+        "",
+    };
+    uint16_t ntripServer_CasterPort[NTRIP_SERVER_MAX] =
+    {
+        2101,
+        2101,
+        2101,
+        2101,
+    };
+    char ntripServer_CasterUser[NTRIP_SERVER_MAX][NTRIP_SERVER_STRING_SIZE] =
+    {
+        ""
+        "",
+        "",
+        "",
+    };
+    char ntripServer_CasterUserPW[NTRIP_SERVER_MAX][NTRIP_SERVER_STRING_SIZE] =
+    {
+        "",
+        "",
+        "",
+        "",
+    };
+    char ntripServer_MountPoint[NTRIP_SERVER_MAX][NTRIP_SERVER_STRING_SIZE] =
+    {
+        "bldr_dwntwn2", // NTRIP Server
+        "",
+        "",
+        "",
+    };
+    char ntripServer_MountPointPW[NTRIP_SERVER_MAX][NTRIP_SERVER_STRING_SIZE] =
+    {
+        "WR5wRo4H",
+        "",
+        "",
+        "",
+    };
+
+    // OS
+    uint8_t bluetoothInterruptsCore =
+        1;                         // Core where hardware is started and interrupts are assigned to, 0=core, 1=Arduino
+    uint8_t btReadTaskCore = 1;             // Core where task should run, 0=core, 1=Arduino
+    uint8_t btReadTaskPriority = 1; // Read from BT SPP and Write to GNSS. 3 being the highest, and 0 being the lowest
+    bool debugMalloc = false;
+    bool enableHeapReport = false; // Turn on to display free heap
+    bool enablePrintIdleTime = false;
+    bool enablePsram = true; // Control the use on onboard PSRAM. Used for testing behavior when PSRAM is not available.
+    bool enableTaskReports = false;                       // Turn on to display task high water marks
+    uint8_t gnssReadTaskCore = 1;           // Core where task should run, 0=core, 1=Arduino
+    uint8_t gnssReadTaskPriority =
+        1; // Read from GNSS and Write to circular buffer (SD, TCP, BT). 3 being the highest, and 0 being the lowest
+    uint8_t gnssUartInterruptsCore =
+        1; // Core where hardware is started and interrupts are assigned to, 0=core, 1=Arduino
+    bool haltOnPanic = false; // Halt after beginVersion if the reset reason was panic
+    uint8_t handleGnssDataTaskCore = 1;     // Core where task should run, 0=core, 1=Arduino
+    uint8_t handleGnssDataTaskPriority = 1; // Read from the circular buffer and dole out to end points (SD, TCP, BT).
+    uint8_t i2cInterruptsCore = 1; // Core where hardware is started and interrupts are assigned to, 0=core, 1=Arduino
+    uint8_t measurementScale = MEASUREMENT_UNITS_METERS;
+    bool printBootTimes = false; // Print times and deltas during boot
+    bool printPartitionTable = false;
+    bool printTaskStartStop = false;
+    uint16_t psramMallocLevel = 40; // By default, push as much as possible to PSRAM. Needed to do secure WiFi (MQTT) + BT + PPL
+    uint32_t rebootMinutes = 0; // Disabled, reboots after uptime reaches this number of minutes
+    int resetCount = 0;
+
+    // Periodic Display
+    PeriodicDisplay_t periodicDisplay = (PeriodicDisplay_t)0; //Turn off all periodic debug displays by default.
+    uint32_t periodicDisplayInterval = 15 * 1000;
+
+    // Point Perfect
+    bool autoKeyRenewal = true; // Attempt to get keys if we get under 28 days from the expiration date
+    bool debugPpCertificate = false; // Debug Point Perfect certificate management
+    int geographicRegion = 0; // Default to US - first entry in Regional_Information_Table
+    uint64_t lastKeyAttempt = 0;     // Epoch time of last attempt at obtaining keys
+    char pointPerfectBrokerHost[50] = ""; // pp.services.u-blox.com
+    char pointPerfectClientID[50] = ""; // Obtained during ZTP
+    char pointPerfectCurrentKey[33] = ""; // 32 hexadecimal digits = 128 bits = 16 Bytes
+    uint64_t pointPerfectCurrentKeyDuration = 0;
+    uint64_t pointPerfectCurrentKeyStart = 0;
+    char pointPerfectDeviceProfileToken[40] = "";
+    char pointPerfectKeyDistributionTopic[20] = ""; // /pp/ubx/0236/ip or /pp/ubx/0236/Lb - from ZTP
+    char pointPerfectNextKey[33] = "";
+    uint64_t pointPerfectNextKeyDuration = 0;
+    uint64_t pointPerfectNextKeyStart = 0;
+    uint16_t pplFixTimeoutS = 180; // Number of seconds of no RTK fix when using PPL before resetting GNSS
+    // The correction topics are provided during ZTP (pointperfectTryZtpToken)
+    // For IP-only plans, these will be /pp/ip/us, /pp/ip/eu, etc.
+    // For L-Band+IP plans, these will be /pp/Lb/us, /pp/Lb/eu, etc.
+    // L-Band-only plans have no correction topics
+    char regionalCorrectionTopics[numRegionalAreas][10] =
+    {
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+    uint8_t pointPerfectService = PP_NICKNAME_DISABLED; // See ppServices[]. Records which PointPerfect service the user has chosen.
+
+    // Profiles
+    char profileName[50] = "";
+
+    // Pulse
+    bool enableExternalPulse = true;                           // Send pulse once lock is achieved
+    uint64_t externalPulseLength_us = 200000;                  // us length of pulse, max of 60s = 60 * 1000 * 1000
+    pulseEdgeType_e externalPulsePolarity = PULSE_RISING_EDGE; // Pulse rises for pulse length, then falls
+    uint64_t externalPulseTimeBetweenPulse_us = 1000000;       // us between pulses, max of 60s = 60 * 1000 * 1000
+
+    // Ring Buffer
+    bool enablePrintRingBufferOffsets = false;
+    int gnssHandlerBufferSize =
+        1024 * 4; // This buffer is filled from the UART receive buffer, and is then written to SD
+
+    // Rover operation
+    uint8_t dynamicModel = 254; // Default will be applied by checkGNSSArrayDefaults
+    bool enablePrintRoverAccuracy = true;
+    int16_t minCN0 = 6;   // Minimum satellite signal level for navigation. ZED-F9P default is 6 dBHz
+    // Minimum elevation (in deg) for a GNSS satellite to be used in NAV
+    // Note: we use 8-bit unsigned here, but some platforms (ZED, mosaic-X5) support negative elevation limits
+    uint8_t minElev = 10;
+
+    // RTC (Real Time Clock)
+    bool enablePrintRtcSync = false;
+
+    // RTCM
+    bool debugRtcmBuffers = false;
+    char rtcm1033AntennaDescriptor[21] = "ADVNULLANTENNA"; // Supported on mosaic-X5 [20], LG290P [31], UM980 [31]
+    char rtcm1033AntennaSerialNr[21] = "Unknown"; // Supported on mosaic-X5 [20], LG290P [31], UM980 [31]
+    uint8_t rtcm1033AntennaSetupID = 0; // 0-255 Supported on mosaic-X5, LG290P, UM980
+
+    // SD Card
+    bool enablePrintBufferOverrun = false;
+    bool enablePrintSDBuffers = false;
+    bool enableSD = true;
+    bool forceResetOnSDFail = false; // Set to true to reset system if SD is detected but fails to start.
+
+    // Serial
+    uint32_t dataPortBaud =
+        (115200 * 2); // Default to 230400bps. This interface can be a bottleneck at high fix rates but allows the SD buffer to be reduced to 6k.
+    bool echoUserInput = true;
+    bool enableGnssToUsbSerial = false;
+    uint32_t radioPortBaud = 57600;       // Default to 57600bps to support connection to SiK1000 type telemetry radios
+    int16_t serialTimeoutGNSS = 1; // In ms - used during serialGNSS->begin. Number of ms to pass of no data before
+                                   // hardware serial reports data available.
+    bool enableNmeaOnRadio = true; // Depends on the platform and GNSS
+
+    // Setup Button
+    bool disableSetupButton = false;                  // By default, allow setup through the overlay button(s)
+
+    // State
+    bool enablePrintDuplicateStates = false;
+    bool enablePrintStates = true;
+    SystemState lastState = STATE_NOT_SET; // Start unit in last known state
+
+    // TCP Client
+    bool debugTcpClient = false;
+    bool enableTcpClient = false;
+    char tcpClientHost[50] = "";
+    uint16_t tcpClientPort = 2948; // TCP client port. 2948 is GPS Daemon: http://tcp-udp-ports.com/port-2948.htm
+
+    // TCP Server
+    bool debugTcpServer = false;
+    bool enableTcpServer = false;
+    uint16_t tcpServerPort = 2948; // TCP server port, 2948 is GPS Daemon: http://tcp-udp-ports.com/port-2948.htm
+    bool tcpOverWiFiStation = true; // Should TCP server use Station (true) or AP (false)
+    bool udpOverWiFiStation = true; // Should UDP server use Station (true) or AP (false)
+
+    // Time Zone - Default to UTC
+    int8_t timeZoneHours = 0;
+    int8_t timeZoneMinutes = 0;
+    int8_t timeZoneSeconds = 0;
+
+    // UBX
+#ifdef COMPILE_ZED
+    uint8_t ubxConstellationsEnabled[MAX_UBX_CONSTELLATIONS] = {254}; // Mark first record with key so defaults will be applied.
+    uint8_t ubxMessageRates[MAX_UBX_MSG] = {254}; // Mark first record with key so defaults will be applied.
+    uint8_t ubxMessageRatesBase[MAX_UBX_MSG_RTCM] = {
+        254}; // Mark first record with key so defaults will be applied. Int value for each supported message - Report
+              // rates for RTCM Base. Default to u-blox recommended rates.
+#endif // COMPILE_ZED
+
+    // UDP Server
+    bool debugUdpServer = false;
+    bool enableUdpServer = false;
+    uint16_t udpServerPort = 10110; // NMEA-0183 Navigational Data: https://tcp-udp-ports.com/port-10110.htm
+
+    // UM980
+    bool enableImuCompensationDebug = false;
+    bool enableImuDebug = false; // Turn on to display IMU library debug messages
+    bool enableTiltCompensation = true; // Allow user to disable tilt compensation on the models that have an IMU
+#ifdef COMPILE_UM980
+    uint8_t um980Constellations[MAX_UM980_CONSTELLATIONS] = {254}; // Mark first record with key so defaults will be applied.
+    float um980MessageRatesNMEA[MAX_UM980_NMEA_MSG] = {254}; // Mark first record with key so defaults will be applied.
+    float um980MessageRatesRTCMBase[MAX_UM980_RTCM_MSG] = {
+        254}; // Mark first record with key so defaults will be applied. Int value for each supported message - Report
+              // rates for RTCM Base. Default to Unicore recommended rates.
+    float um980MessageRatesRTCMRover[MAX_UM980_RTCM_MSG] = {
+        254}; // Mark first record with key so defaults will be applied. Int value for each supported message - Report
+              // rates for RTCM Base. Default to Unicore recommended rates.
+    bool um980FixedBaseLLHSubtractSeparation = false; // Set true to subtract geoidal separation from fixed base LLH
+#endif // COMPILE_UM980
+
+    // mosaic
+#ifdef COMPILE_MOSAICX5
+    uint8_t mosaicConstellations[MAX_MOSAIC_CONSTELLATIONS] = {254}; // Mark first record with key so defaults will be applied.
+    // Each Stream has one connection descriptor and one interval.
+    // If a NMEA message is disabled, its entry in mosaicMessageStreamNMEA is 0.
+    // If a NMEA message is allocated to Stream1, its entry in mosaicMessageStreamNMEA is 1.
+    // Etc..
+    uint8_t mosaicMessageStreamNMEA[MAX_MOSAIC_NMEA_MSG] = {254}; // Mark first record with key so defaults will be applied.
+    // mosaicStreamIntervalsNMEA contains the interval for each of the MOSAIC_NUM_NMEA_STREAMS NMEA Streams
+    // It should be an array of mosaicMessageRates (enum). But we'll make life easy for ourselves and use uint8_t
+    // The interval will never be "off". To disable a message, set the stream to 0.
+    uint8_t mosaicStreamIntervalsNMEA[MOSAIC_NUM_NMEA_STREAMS] = MOSAIC_DEFAULT_NMEA_STREAM_INTERVALS;
+    //mosaicRTCMv2MsgRate mosaicMessageRatesRTCMv2Rover[MAX_MOSAIC_RTCM_V2_MSG] = {
+    //    { 65534, false } }; // Mark first record with key so defaults will be applied
+    //mosaicRTCMv2MsgRate mosaicMessageRatesRTCMv2Base[MAX_MOSAIC_RTCM_V2_MSG] = {
+    //    { 65534, false } }; // Mark first record with key so defaults will be applied
+    float mosaicMessageIntervalsRTCMv3Rover[MAX_MOSAIC_RTCM_V3_INTERVAL_GROUPS] = {
+        0.0 }; // Mark first record with illegal value so defaults will be applied
+    float mosaicMessageIntervalsRTCMv3Base[MAX_MOSAIC_RTCM_V3_INTERVAL_GROUPS] = {
+        0.0 }; // Mark first record with illegal value so defaults will be applied
+    uint8_t mosaicMessageEnabledRTCMv3Rover[MAX_MOSAIC_RTCM_V3_MSG] = {
+        254 }; // Mark first record with key so defaults will be applied
+    uint8_t mosaicMessageEnabledRTCMv3Base[MAX_MOSAIC_RTCM_V3_MSG] = {
+        254 }; // Mark first record with key so defaults will be applied
+#endif // COMPILE_MOSAICX5
+
+    // We use enableLogging to control the logging of NMEA streams
+    // RINEX logging needs its own enable
+    bool enableLoggingRINEX = false;
+    uint8_t RINEXFileDuration = MOSAIC_FILE_DURATION_HOUR24;
+    uint8_t RINEXObsInterval = MOSAIC_OBS_INTERVAL_SEC30;
+    bool externalEventPolarity = false; // false == Low2High; true == High2Low
+
+    // Web Server
+    uint16_t httpPort = 80;
+
+    // WiFi
+    bool debugWebServer = false;
+    bool debugWifiState = false;
+    bool enableCaptivePortal = true;
+    uint8_t wifiChannel = 1; //Valid channels are 1 to 14
+    bool wifiConfigOverAP = true; // Configure device over Access Point or have it connect to WiFi
+    WiFiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
+        {"", ""},
+        {"", ""},
+        {"", ""},
+        {"", ""},
+    };
+    // Must cover a full AP scan, association, DHCP and network priority arbitration
+    uint32_t wifiConnectTimeoutMs = 30000;
+
+    bool outputTipAltitude = false; // If enabled, subtract the pole length and APC from the GNSS receiver's reported altitude
+
+    // Localized distribution
+    bool useLocalizedDistribution = false;
+    uint8_t localizedDistributionTileLevel = 5;
+    bool useAssistNow = false;
+
+    bool requestKeyUpdate = false; // Set to true to force a key provisioning attempt
+
+    bool debugLora = false;
+    bool enableLora = false;
+    float loraCoordinationFrequency = 910.000;
+    int loraSerialInteractionTimeout_s = 30; // Seconds without user serial that must elapse before LoRa radio goes into dedicated listening mode
+    bool loraSaveSettingsToFlash = false; // Passed to LoRa (>= 3.0.1) as AT+SAVE= . When true, updated settings are saved at each AT+TRANS
+    int loraTransmitGain_dB = 10; // Passed to LoRa as AT+PWR=
+    bool enableMultipathMitigation = true; // Multipath mitigation. UM980 specific.
+
+#ifdef COMPILE_LG290P
+    uint8_t lg290pConstellations[MAX_LG290P_CONSTELLATIONS] = {254}; // Mark first record with key so defaults will be applied.
+    int lg290pMessageRatesNMEA[MAX_LG290P_NMEA_MSG] = {254}; // Mark first record with key so defaults will be applied.
+    int lg290pMessageRatesRTCMBase[MAX_LG290P_RTCM_MSG] = {
+        254}; // Mark first record with key so defaults will be applied. Int value for each supported message - Report
+              // rates for RTCM Base. Default to Quectel recommended rates.
+    int lg290pMessageRatesRTCMRover[MAX_LG290P_RTCM_MSG] = {
+        254}; // Mark first record with key so defaults will be applied. Int value for each supported message - Report
+              // rates for RTCM Base. Default to Quectel recommended rates.
+    int lg290pMessageRatesPQTM[MAX_LG290P_PQTM_MSG] = {254}; // Mark first record with key so defaults will be applied.
+    uint16_t lg290pRtkDifferentialAge = 120; // LG290P only. Sets the max differential age of RTK fix. 1-600s. Default: 120s
+    uint16_t lg290pRtkDifferentialSourceType = 0; // LG290P only. 0 = Auto, 1 = Normal, 2 = Wide Lane. Default is Auto.
+    uint16_t lg290pRtkReliabilityLevel = 3; // LG290P only. 1 = Very relax, 2 = Relax, 3 = Medium, 4 = Strict, 5 = Very strict. Default is 3.
+#endif // COMPILE_LG290P
+
+    bool debugSettings = false;
+    bool enableNtripCaster = false; //When true, respond as a faux NTRIP Caster to incoming TCP connections
+    bool baseCasterOverride = false; //When true, user has put device into 'BaseCast' mode. Change settings, but don't save to NVM.
+    bool debugCLI = false; //When true, output BLE CLI interactions over serial
+    uint16_t cliBlePrintDelay_ms = 50; // Time delayed between prints during a LIST command to avoid overwhelming the BLE connection
+    uint32_t gnssConfigureRequest = 0; // Bitfield containing the change requests for various settings on the GNSS receiver
+    bool debugGnssConfig = false; // Enable to print output during gnssUpdate
+
+    int pppMode = PPP_MODE_HAS; // 0 = Disable, 1 = B2b PPP, 2 = HAS, 0xFF = Auto
+    int pppDatum = 1; // 1 = WGS84, 2 = PPP Original, 3 = CGCS2000
+    int pppTimeout = 120; // Seconds without PPP corrections before fallback
+    float pppHorizontalConvergence = 0.10; // Meters, required horizontal convergence for PPP fix
+    float pppVerticalConvergence = 0.15; // Meters, required vertical convergence for PPP fix
+
+    // Add new settings to appropriate group above or create new group
+    // Then also add to the same group in rtkSettingsEntries below
+} settings;
+
+const uint8_t LOCALIZED_DISTRIBUTION_TILE_LEVELS = 6;
+const char *localizedDistributionTileLevelNames[LOCALIZED_DISTRIBUTION_TILE_LEVELS] = {
+    "1000 x 1000km sparse",
+    "500 x 500km sparse",
+    "250 x 250km sparse",
+    "1000 x 1000km high density",
+    "500 x 500km high density",
+    "250 x 250km high density",
+};
+
+typedef enum
+{
+    NON = 0,               // NONE - must be first
+    L29 = (1 << 0),        // LG290P
+    MX5 = (1 << 1),        // mosaic-X5
+    U98 = (1 << 2),        // UM980 - Possible future product
+    ZF9 = (1 << 3),        // ZED-F9P - Possible future product
+    ZX2 = (1 << 4),        // ZED-X20P
+    ALL = (1 << 5) - 1,    // ALL - must be the highest single variant
+    ZED = ZF9 | ZX2,       // Hybrids are possible (enums don't have to be consecutive)
+    MSM = L29,             // Platforms which _require_ parameter selection of MSM7 over MSM4
+    HAS = L29 | ZX2,       // Platforms which support Galileo HAS - includes ZED-X20P with HPG >= 2.10
+    R33 = L29 | MX5 | U98, // Platforms which support configuration of the RTCM 1033 Antenna Descriptor
+    // Note: when adding new variants or hybrids, update settingAvailableOnPlatform in menuComands.ino to match
+} Facet_FP_Variant;
+
+typedef bool (* AFTER_CMD)(const char *settingName, void *settingData, int settingType);
+
+// Forward routines
+bool wifiAfterCommand(const char *settingName, void *settingData, int settingType);
+
+typedef struct
+{
+    bool inWebConfig; //This setting is exposed during WiFi/Eth config
+    bool inCommands;  //This setting is exposer over CLI
+    bool useSuffix;   // Split command at underscore, use suffix in alternate command table
+    bool platEvk;
+    bool platFacetMosaic;
+    bool platTorch;
+    bool platPostcard;
+    Facet_FP_Variant platFacetFP;
+    bool platTorchX2;
+    RTK_Settings_Types type;
+    int qualifier;
+    void *var;
+    const char *name;
+    AFTER_CMD afterSetCmd; // Functions to execute after the set command successfully completes
+} RTK_Settings_Entry;
+
+#define COMMAND_PROFILE_0_INDEX            -1
+#define COMMAND_PROFILE_NUMBER             (COMMAND_PROFILE_0_INDEX - MAX_PROFILE_COUNT) // -1 - 8 = -9
+#define COMMAND_FIRMWARE_VERSION           (COMMAND_PROFILE_NUMBER - 1)         //  -9 - 1 = -10
+#define COMMAND_REMOTE_FIRMWARE_VERSION    (COMMAND_FIRMWARE_VERSION - 1)       // -10 - 1 = -11
+#define COMMAND_ENABLE_RC_FIRMWARE         (COMMAND_REMOTE_FIRMWARE_VERSION - 1)// -11 - 1 = -12
+#define COMMAND_GNSS_MODULE_INFO           (COMMAND_ENABLE_RC_FIRMWARE - 1)     // -12 - 1 = -13
+#define COMMAND_BATTERY_LEVEL_PERCENT      (COMMAND_GNSS_MODULE_INFO - 1)       // -13 - 1 = -14
+#define COMMAND_BATTERY_VOLTAGE            (COMMAND_BATTERY_LEVEL_PERCENT - 1)  // -14 - 1 = -15
+#define COMMAND_BATTERY_CHARGING_PERCENT   (COMMAND_BATTERY_VOLTAGE - 1)        // -15 - 1 = -16
+#define COMMAND_BLUETOOTH_ID               (COMMAND_BATTERY_CHARGING_PERCENT - 1)// -16 - 1 = -17
+#define COMMAND_DEVICE_NAME                (COMMAND_BLUETOOTH_ID - 1)           // -17 - 1 = -18
+#define COMMAND_DEVICE_ID                  (COMMAND_DEVICE_NAME - 1)            // -18 - 1 = -19
+#define COMMAND_TILT_STATE                 (COMMAND_DEVICE_ID - 1)              // -19 - 1 = -20
+#define COMMAND_UNKNOWN                    (COMMAND_TILT_STATE - 1)              // -20 - 1 = -21
+#define COMMAND_COUNT                      (-(COMMAND_UNKNOWN))                 // -21
+
+// Exit types for processCommand
+typedef enum
+{
+    CLI_UNKNOWN = 0,
+    CLI_ERROR, // 1
+    CLI_OK,    // 2
+    CLI_BAD_FORMAT,
+    CLI_UNKNOWN_SETTING,
+    CLI_SETTING_READ_ONLY,
+    CLI_UNKNOWN_COMMAND,
+    CLI_EXIT,
+    CLI_LIST,
+} t_cliResult;
+
+const RTK_Settings_Entry rtkSettingsEntries[] =
+{
+// inWebConfig = Should this setting be sent to the WiFi/Eth Config page
+// inCommands = Should this setting be exposed over the CLI
+// useSuffix = Setting has an additional array to search
+// EVK/Facet mosaic/Torch/Postcard/Facet FP = Is this setting supported on X platform
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+    // =======================================================================================================
+    // Priority Settings which are not alphabetized in commandIndex
+    // =======================================================================================================
+
+    // Detected GNSS Receiver - only for Facet FP. Save / load first so settingAvailableOnPlatform is correct on Facet FP
+    { 0, 0, 0, 0, 0, 0, 0, ALL, 0, tGnssReceiver,     0, & settings.detectedGnssReceiver, "detectedGnssReceiver", nullptr, },
+
+    // Common settings which use the same name on multiple Facet FP platforms
+    // We need these - for Facet FP - because:
+    //   During setup, the settings are loaded before we know which GNSS is present
+    //   Previously, the setting would be applied to whichever GNSS is matched first alphabetically
+    //   We need to apply these settings to all GNSS initially so that when we
+    //   write the actual settings (vs the possible settings), the settings for
+    //   that GNSS are correct
+    //   (recordSystemSettings is called in multiple places: beginVersion, gnssDetectReceiverType, etc.)
+    // constellation_ is common to all GNSS, but not all support (e.g.) NavIC
+    // messageRateNMEA_, messageRateRTCMBase_, and messageRateRTCMRover_ are common to UM980 and LG290P
+    // The qualifier is defined inside updateSettingWithValue, parseLine
+    { 0, 0, 1, 1, 1, 1, 1, ALL, 1, tCmnCnst,  0, nullptr, "constellation_", gnssCmdUpdateConstellations, },
+    { 0, 0, 1, 1, 1, 1, 1, ALL, 1, tCmnRtNm,  0, nullptr, "messageRateNMEA_", gnssCmdUpdateMessageRates, },
+    { 0, 0, 1, 1, 1, 1, 1, ALL, 1, tCnRtRtB,  0, nullptr, "messageRateRTCMBase_", gnssCmdUpdateMessageRates, },
+    { 0, 0, 1, 1, 1, 1, 1, ALL, 1, tCnRtRtR,  0, nullptr, "messageRateRTCMRover_", gnssCmdUpdateMessageRates, },
+
+    // <--- Insert any new essential "priority" (non-sorted) settings above this line --->
+
+    // endOfPrioritySettings is a special 'null' entry which does not appear in commandIndex
+    { 0, 0, 0, 0, 0, 0, 0, NON, 0, _bool,     0, nullptr, "endOfPrioritySettings", nullptr, },
+
+    // =======================================================================================================
+    // Everything below here will be sorted (alphabetized) in commandIndex
+    // =======================================================================================================
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+    // Antenna
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _int16_t,  0, & settings.antennaHeight_mm, "antennaHeight", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _float,    2, & settings.antennaPhaseCenter_mm, "antennaPhaseCenter", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _uint16_t, 0, & settings.ARPLoggingInterval_s, "ARPLoggingInterval", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enableARPLogging, "enableARPLogging", nullptr, },
+
+    // Base operation
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCoordInp, 0, & settings.coordinateInputType, "coordinateInputType", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _double,   4, & settings.fixedAltitude, "fixedAltitude", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.fixedBase, "fixedBase", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.fixedBaseCoordinateType, "fixedBaseCoordinateType", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _double,   3, & settings.fixedEcefX, "fixedEcefX", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _double,   3, & settings.fixedEcefY, "fixedEcefY", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _double,   3, & settings.fixedEcefZ, "fixedEcefZ", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _double,   9, & settings.fixedLat, "fixedLat", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _double,   9, & settings.fixedLong, "fixedLong", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _int,      0, & settings.observationSeconds, "observationSeconds", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _float,    2, & settings.observationPositionAccuracy, "observationPositionAccuracy", nullptr, },
+    { 0, 1, 0, 1, 0, 1, 1, ALL, 1, _float,    1, & settings.surveyInStartingAccuracy, "surveyInStartingAccuracy", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, MSM, 1, _bool,     0, & settings.useMSM7, "useMSM7",  nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, MSM, 1, _int,      0, & settings.rtcmMinElev, "rtcmMinElev",  nullptr, },
+
+    // Battery
+    { 0, 0, 0, 0, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintBatteryMessages, "enablePrintBatteryMessages", nullptr, },
+    { 1, 1, 0, 0, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.shutdownNoChargeTimeoutMinutes, "shutdownNoChargeTimeoutMinutes", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+
+    // Beeper
+    { 1, 1, 0, 0, 0, 1, 0, ALL, 1, _bool,     0, & settings.enableBeeper, "enableBeeper", nullptr, },
+
+    // Bluetooth
+    { 0, 0, 0, 0, 0, 0, 1, ALL, 1, _double,   3, & settings.accessoryTimeOffset_s, "accessoryTimeOffset", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tBtRadio,  0, & settings.bluetoothRadioType, "bluetoothRadioType", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.clearBtPairings, "clearBtPairings", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.eaProtocol), & settings.eaProtocol, "eaProtocol", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.sppRxQueueSize, "sppRxQueueSize", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.sppTxQueueSize, "sppTxQueueSize", nullptr, },
+
+    // Corrections
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _int,      0, & settings.correctionsSourcesLifetime_s, "correctionsSourcesLifetime", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tCorrSPri, CORR_NUM, & settings.correctionsSourcesPriority, "correctionsPriority_", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugCorrections, "debugCorrections", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _uint8_t,  0, & settings.enableExtCorrRadio, "enableExtCorrRadio", nullptr, }, // uint8_t needed for 254
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // Data Port Multiplexer
+    { 1, 1, 0, 0, 1, 0, 0, NON, 0, tMuxConn,  0, & settings.dataPortChannel, "dataPortChannel", nullptr, },
+
+    // Display
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enableResetDisplay, "enableResetDisplay", nullptr, },
+
+    // ESP Now
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugEspNow, "debugEspNow", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableEspNow, "enableEspNow", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.espnowPeerCount, "espnowPeerCount", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tEspNowPr, ESPNOW_MAX_PEERS, & settings.espnowPeers[0][0], "espnowPeer_", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // Ethernet
+    { 0, 0, 0, 1, 0, 0, 0, NON, 0, _bool,     0, & settings.enablePrintEthernetDiag, "enablePrintEthernetDiag", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _bool,     0, & settings.ethernetDHCP, "ethernetDHCP", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _IPString, 0, & settings.ethernetDNS, "ethernetDNS", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _IPString, 0, & settings.ethernetGateway, "ethernetGateway", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _IPString, 0, & settings.ethernetIP, "ethernetIP", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _IPString, 0, & settings.ethernetSubnet, "ethernetSubnet", nullptr, },
+
+    // Firmware
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.autoFirmwareCheckMinutes, "autoFirmwareCheckMinutes", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugFirmwareUpdate, "debugFirmwareUpdate", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableAutoFirmwareUpdate, "enableAutoFirmwareUpdate", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.csvUrl), & settings.csvUrl, "csvUrl", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.otaRequestEsp32, "otaRequestEsp32", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.otaRequestGnss, "otaRequestGnss", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.otaRequestLora, "otaRequestLora", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.otaRequestImu, "otaRequestImu", nullptr, },
+
+    // GNSS UART
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.serialGNSSRxFullThreshold, "serialGNSSRxFullThreshold", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int,      0, & settings.uartReceiveBufferSize, "uartReceiveBufferSize", nullptr, },
+
+    // GNSS Receiver
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugGnss, "debugGnss", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugGnssConfig, "debugGnssConfig", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintPosition, "enablePrintPosition", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.measurementRateMs, "measurementRateMs", nullptr, },
+
+    // Hardware
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.defaultDoubleTapInterval_ms, "defaultDoubleTapInterval", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 0, NON, 0, _bool,     0, & settings.enableExternalHardwareEventLogging, "enableExternalHardwareEventLogging", nullptr, },
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _uint16_t, 0, & settings.spiFrequency, "spiFrequency", nullptr, },
+
+    // HTTP
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugHttpClientData, "debugHttpClientData", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugHttpClientState, "debugHttpClientState", nullptr, },
+
+    // IMU
+    { 0, 0, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.detectedTilt, "detectedTilt", nullptr, },
+    { 0, 0, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.testedTilt, "testedTilt", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // Log file
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.alignedLogFiles, "alignedLogFiles", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enableLogging, "enableLogging", nullptr, },
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enablePrintLogFileMessages, "enablePrintLogFileMessages", nullptr, },
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enablePrintLogFileStatus, "enablePrintLogFileStatus", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _int,      0, & settings.maxLogLength_minutes, "maxLogLength", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 1, ALL, 0, _int,      0, & settings.maxLogTime_minutes, "maxLogTime", nullptr, },
+
+    // Mosaic
+#ifdef  COMPILE_MOSAICX5
+    { 1, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicConst,  MAX_MOSAIC_CONSTELLATIONS, & settings.mosaicConstellations, "constellation_", gnssCmdUpdateConstellations, },
+    { 0, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicMSNmea, MAX_MOSAIC_NMEA_MSG, & settings.mosaicMessageStreamNMEA, "messageStreamNMEA_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicSINmea, MOSAIC_NUM_NMEA_STREAMS, & settings.mosaicStreamIntervalsNMEA, "streamIntervalNMEA_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicMIRvRT, MAX_MOSAIC_RTCM_V3_INTERVAL_GROUPS, & settings.mosaicMessageIntervalsRTCMv3Rover, "messageIntervalRTCMRover_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicMIBaRT, MAX_MOSAIC_RTCM_V3_INTERVAL_GROUPS, & settings.mosaicMessageIntervalsRTCMv3Base, "messageIntervalRTCMBase_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicMERvRT, MAX_MOSAIC_RTCM_V3_MSG, & settings.mosaicMessageEnabledRTCMv3Rover, "messageEnabledRTCMRover_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 1, 0, 0, MX5, 0, tMosaicMEBaRT, MAX_MOSAIC_RTCM_V3_MSG, & settings.mosaicMessageEnabledRTCMv3Base, "messageEnabledRTCMBase_", gnssCmdUpdateMessageRates, },
+    { 1, 1, 0, 0, 1, 0, 0, MX5, 0, _bool,     0, & settings.enableLoggingRINEX, "enableLoggingRINEX", nullptr, },
+    { 1, 1, 0, 0, 1, 0, 0, MX5, 0, _uint8_t,  0, & settings.RINEXFileDuration, "RINEXFileDuration", nullptr, },
+    { 1, 1, 0, 0, 1, 0, 0, MX5, 0, _uint8_t,  0, & settings.RINEXObsInterval, "RINEXObsInterval", nullptr, },
+    { 1, 1, 0, 0, 1, 0, 0, NON, 0, _bool,     0, & settings.externalEventPolarity, "externalEventPolarity", nullptr, },
+#endif  // COMPILE_MOSAICX5
+
+    // MQTT
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugMqttClientData, "debugMqttClientData", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugMqttClientState, "debugMqttClientState", nullptr, },
+
+    // Multicast DNS
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.mdnsEnable, "mdnsEnable", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.mdnsHostName), & settings.mdnsHostName, "mdnsHostName", nullptr, },
+
+    // Network layer
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugAppleAccessory, "debugAppleAccessory", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugNetworkLayer, "debugNetworkLayer", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.printNetworkStatus, "printNetworkStatus", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.networkClientWriteTimeout_ms, "networkClientWriteTimeout", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // NTP (Ethernet Only)
+    { 0, 0, 0, 1, 0, 0, 0, NON, 0, _bool,     0, & settings.debugNtp, "debugNtp", nullptr, },
+    { 0, 1, 0, 1, 0, 0, 0, NON, 0, _bool,     0, & settings.enableNTPFile, "enableNTPFile", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _uint16_t, 0, & settings.ethernetNtpPort, "ethernetNtpPort", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _uint8_t,  0, & settings.ntpPollExponent, "ntpPollExponent", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _int8_t,   0, & settings.ntpPrecision, "ntpPrecision", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, tCharArry, sizeof(settings.ntpReferenceId), & settings.ntpReferenceId, "ntpReferenceId", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _uint32_t, 0, & settings.ntpRootDelay, "ntpRootDelay", nullptr, },
+    { 1, 1, 0, 1, 0, 0, 0, NON, 0, _uint32_t, 0, & settings.ntpRootDispersion, "ntpRootDispersion", nullptr, },
+
+    // NTRIP Client
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugNtripClientRtcm, "debugNtripClientRtcm", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugNtripClientState, "debugNtripClientState", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableNtripClient, "enableNtripClient", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.ntripClient_CasterHost), & settings.ntripClient_CasterHost, "ntripClientCasterHost", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.ntripClient_CasterPort, "ntripClientCasterPort", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.ntripClient_CasterUser), & settings.ntripClient_CasterUser, "ntripClientCasterUser", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.ntripClient_CasterUserPW), & settings.ntripClient_CasterUserPW, "ntripClientCasterUserPW", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.ntripClient_MountPoint), & settings.ntripClient_MountPoint, "ntripClientMountPoint", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.ntripClient_MountPointPW), & settings.ntripClient_MountPointPW, "ntripClientMountPointPW", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.ntripClient_TransmitGGA, "ntripClientTransmitGGA", nullptr, },
+
+    // NTRIP Server
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugNtripServerRtcm, "debugNtripServerRtcm", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugNtripServerState, "debugNtripServerState", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableNtripServer, "enableNtripServer", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableRtcmMessageChecking, "enableRtcmMessageChecking", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSCEn,    NTRIP_SERVER_MAX, & settings.ntripServer_CasterEnabled[0], "ntripServerCasterEnabled_", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSCHost,  NTRIP_SERVER_MAX, & settings.ntripServer_CasterHost[0], "ntripServerCasterHost_", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSCPort,  NTRIP_SERVER_MAX, & settings.ntripServer_CasterPort[0], "ntripServerCasterPort_", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSCUser,  NTRIP_SERVER_MAX, & settings.ntripServer_CasterUser[0], "ntripServerCasterUser_", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSCUsrPw, NTRIP_SERVER_MAX, & settings.ntripServer_CasterUserPW[0], "ntripServerCasterUserPW_", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSMtPt,   NTRIP_SERVER_MAX, & settings.ntripServer_MountPoint[0], "ntripServerMountPoint_", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tNSMtPtPw, NTRIP_SERVER_MAX, & settings.ntripServer_MountPointPW[0], "ntripServerMountPointPW_", nullptr, },
+
+//                         F
+//                         a
+//                   F     c
+//    i              a     e
+//    n  i           c     t
+//    W  n  u        e
+//    e  C  s     F  t     V  P
+//    b  o  e     a        2  o
+//    C  m  S     c  M        s
+//    o  m  u     e  o  T  L  t
+//    n  a  f     t  s  o  B  c
+//    f  n  f  E     a  r  a  a
+//    i  d  i  v  V  i  c  n  r
+//    g  s  x  k  2  c  h  d  d  Type    Qual  Variable                  Name               afterSetCmd
+
+    // OS
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.bluetoothInterruptsCore, "bluetoothInterruptsCore", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.btReadTaskCore, "btReadTaskCore", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.btReadTaskPriority, "btReadTaskPriority", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugMalloc, "debugMalloc", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableHeapReport, "enableHeapReport", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintIdleTime, "enablePrintIdleTime", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePsram, "enablePsram", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableTaskReports, "enableTaskReports", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.gnssReadTaskCore, "gnssReadTaskCore", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.gnssReadTaskPriority, "gnssReadTaskPriority", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.gnssUartInterruptsCore, "gnssUartInterruptsCore", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.haltOnPanic, "haltOnPanic", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.handleGnssDataTaskCore, "handleGnssDataTaskCore", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.handleGnssDataTaskPriority, "handleGnssDataTaskPriority", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.i2cInterruptsCore, "i2cInterruptsCore", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.measurementScale, "measurementScale", nullptr, }, //Don't show on Config
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.printBootTimes, "printBootTimes", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.printPartitionTable, "printPartitionTable", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.printTaskStartStop, "printTaskStartStop", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.psramMallocLevel, "psramMallocLevel", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.rebootMinutes, "rebootMinutes", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int,      0, & settings.resetCount, "resetCount", nullptr, },
+
+    // Periodic Display
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, tPerDisp,  0, & settings.periodicDisplay, "periodicDisplay", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.periodicDisplayInterval, "periodicDisplayInterval", nullptr, },
+
+    // Point Perfect
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.autoKeyRenewal, "autoKeyRenewal", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugPpCertificate, "debugPpCertificate", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int,      0, & settings.geographicRegion, "geographicRegion", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint64_t, 0, & settings.lastKeyAttempt, "lastKeyAttempt", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.pointPerfectBrokerHost), & settings.pointPerfectBrokerHost, "pointPerfectBrokerHost", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.pointPerfectClientID), & settings.pointPerfectClientID, "pointPerfectClientID", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.pointPerfectCurrentKey), & settings.pointPerfectCurrentKey, "pointPerfectCurrentKey", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint64_t, 0, & settings.pointPerfectCurrentKeyDuration, "pointPerfectCurrentKeyDuration", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint64_t, 0, & settings.pointPerfectCurrentKeyStart, "pointPerfectCurrentKeyStart", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.pointPerfectDeviceProfileToken), & settings.pointPerfectDeviceProfileToken, "pointPerfectDeviceProfileToken", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.pointPerfectKeyDistributionTopic), & settings.pointPerfectKeyDistributionTopic, "pointPerfectKeyDistributionTopic", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.pointPerfectNextKey), & settings.pointPerfectNextKey, "pointPerfectNextKey", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint64_t, 0, & settings.pointPerfectNextKeyDuration, "pointPerfectNextKeyDuration", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint64_t, 0, & settings.pointPerfectNextKeyStart, "pointPerfectNextKeyStart", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.pplFixTimeoutS, "pplFixTimeoutS", nullptr, },
+    { 0, 0, 1, 1, 1, 1, 1, ALL, 1, tRegCorTp, numRegionalAreas, & settings.regionalCorrectionTopics, "regionalCorrectionTopics_", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint8_t, 0, & settings.pointPerfectService, "pointPerfectService", nullptr, },
+
+    // Profiles
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.profileName), & settings.profileName, "profileName", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // Pulse Per Second
+    { 1, 1, 0, 1, 1, 0, 0, NON, 0, _bool,     0, & settings.enableExternalPulse, "enableExternalPulse", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 0, NON, 0, _uint64_t, 0, & settings.externalPulseLength_us, "externalPulseLength", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 0, NON, 0, tPulseEdg, 0, & settings.externalPulsePolarity, "externalPulsePolarity", nullptr, },
+    { 1, 1, 0, 1, 1, 0, 0, NON, 0, _uint64_t, 0, & settings.externalPulseTimeBetweenPulse_us, "externalPulseTimeBetweenPulse", nullptr, },
+
+    // Ring Buffer
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintRingBufferOffsets, "enablePrintRingBufferOffsets", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int,      0, & settings.gnssHandlerBufferSize, "gnssHandlerBufferSize", nullptr, },
+
+    // Rover operation
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.dynamicModel, "dynamicModel", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintRoverAccuracy, "enablePrintRoverAccuracy", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _int16_t,  0, & settings.minCN0, "minCN0", nullptr, }, // Not inWebConfig - createSettingsString gets from GNSS
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.minElev, "minElev", nullptr, },
+
+    // RTC (Real Time Clock)
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintRtcSync, "enablePrintRtcSync", nullptr, },
+
+    // RTCM
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugRtcmBuffers, "debugRtcmBuffers", nullptr, },
+    { 1, 1, 0, 0, 1, 1, 1, R33, 1, tCharArry, sizeof(settings.rtcm1033AntennaDescriptor), & settings.rtcm1033AntennaDescriptor, "rtcm1033AntennaDescriptor", nullptr, },
+    { 1, 1, 0, 0, 1, 1, 1, R33, 1, tCharArry, sizeof(settings.rtcm1033AntennaSerialNr), & settings.rtcm1033AntennaSerialNr, "rtcm1033AntennaSerialNr", nullptr, },
+    { 1, 1, 0, 0, 1, 1, 1, R33, 1, _uint8_t,  0, & settings.rtcm1033AntennaSetupID, "rtcm1033AntennaSetupID", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // SD Card
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enablePrintBufferOverrun, "enablePrintBufferOverrun", nullptr, },
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enablePrintSDBuffers, "enablePrintSDBuffers", nullptr, },
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.enableSD, "enableSD", nullptr, },
+    { 0, 0, 0, 1, 1, 0, 1, ALL, 0, _bool,     0, & settings.forceResetOnSDFail, "forceResetOnSDFail", nullptr, },
+
+    // Serial
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.dataPortBaud, "dataPortBaud", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.echoUserInput, "echoUserInput", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableGnssToUsbSerial, "enableGnssToUsbSerial", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.radioPortBaud, "radioPortBaud", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int16_t,  0, & settings.serialTimeoutGNSS, "serialTimeoutGNSS", nullptr, },
+    { 1, 1, 0, 0, 1, 0, 1, ALL, 0, _bool,     0, & settings.enableNmeaOnRadio, "enableNmeaOnRadio", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // Setup Button
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.disableSetupButton, "disableSetupButton", nullptr, },
+
+    // State
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintDuplicateStates, "enablePrintDuplicateStates", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enablePrintStates, "enablePrintStates", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, tSysState, 0, & settings.lastState, "lastState", nullptr, }, // Not inWebConfig - must be changed to 0:3 by createSettingsString
+
+    // TCP Client
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugTcpClient, "debugTcpClient", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableTcpClient, "enableTcpClient", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, tCharArry, sizeof(settings.tcpClientHost), & settings.tcpClientHost, "tcpClientHost", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.tcpClientPort, "tcpClientPort", nullptr, },
+
+    // TCP Server
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugTcpServer, "debugTcpServer", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableTcpServer, "enableTcpServer", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.tcpServerPort, "tcpServerPort", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.tcpOverWiFiStation, "tcpOverWiFiStation", nullptr, },
+
+    // Time Zone
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int8_t,   0, & settings.timeZoneHours, "timeZoneHours", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int8_t,   0, & settings.timeZoneMinutes, "timeZoneMinutes", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _int8_t,   0, & settings.timeZoneSeconds, "timeZoneSeconds", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+
+    // ublox GNSS Receiver
+#ifdef COMPILE_ZED
+    { 1, 1, 1, 1, 0, 0, 0, ZED, 0, tUbxConst, MAX_UBX_CONSTELLATIONS, & settings.ubxConstellationsEnabled[0], "constellation_", gnssCmdUpdateConstellations, },
+    { 0, 1, 1, 1, 0, 0, 0, ZED, 0, tUbxMsgRt, MAX_UBX_MSG, & settings.ubxMessageRates[0], "ubxMessageRate_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 1, 0, 0, 0, ZED, 0, tUbMsgRtb, MAX_UBX_MSG_RTCM, & settings.ubxMessageRatesBase[0], "ubxMessageRateBase_", gnssCmdUpdateMessageRates, },
+#endif // COMPILE_ZED
+
+    // UDP Server
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugUdpServer, "debugUdpServer", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableUdpServer, "enableUdpServer", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.udpServerPort, "udpServerPort", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.udpOverWiFiStation, "udpOverWiFiStation", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+    { 1, 1, 0, 0, 0, 1, 0, NON, 0, _bool,     3, & settings.enableMultipathMitigation, "enableMultipathMitigation", nullptr, },
+    { 0, 0, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.enableImuCompensationDebug, "enableImuCompensationDebug", nullptr, },
+    { 0, 0, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.enableImuDebug, "enableImuDebug", nullptr, },
+    { 1, 1, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.enableTiltCompensation, "enableTiltCompensation", nullptr, },
+
+    // UM980 GNSS Receiver
+#ifdef  COMPILE_UM980
+    { 1, 1, 1, 0, 0, 1, 0, U98, 0, tUmConst,  MAX_UM980_CONSTELLATIONS, & settings.um980Constellations, "constellation_", gnssCmdUpdateConstellations, },
+    { 1, 1, 0, 0, 0, 1, 0, U98, 0, _bool,     0, & settings.um980FixedBaseLLHSubtractSeparation, "um980FixedBaseLLHSubtractSeparation", nullptr },
+    { 0, 1, 1, 0, 0, 1, 0, U98, 0, tUmMRNmea, MAX_UM980_NMEA_MSG, & settings.um980MessageRatesNMEA, "messageRateNMEA_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 0, 1, 0, U98, 0, tUmMRBaRT, MAX_UM980_RTCM_MSG, & settings.um980MessageRatesRTCMBase, "messageRateRTCMBase_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 0, 1, 0, U98, 0, tUmMRRvRT, MAX_UM980_RTCM_MSG, & settings.um980MessageRatesRTCMRover, "messageRateRTCMRover_", gnssCmdUpdateMessageRates, },
+#endif  // COMPILE_UM980
+
+    // Web Server
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.httpPort, "httpPort", nullptr, },
+
+    // WiFi
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugWebServer, "debugWebServer", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugWifiState, "debugWifiState", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableCaptivePortal, "enableCaptivePortal", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint8_t,  0, & settings.wifiChannel, "wifiChannel", nullptr, },
+    { 1, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.wifiConfigOverAP, "wifiConfigOverAP", nullptr, },
+    { 1, 1, 1, 1, 1, 1, 1, ALL, 1, tWiFiNet,  MAX_WIFI_NETWORKS, & settings.wifiNetworks, "wifiNetwork_", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.wifiConnectTimeoutMs, "wifiConnectTimeoutMs", nullptr, },
+
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.outputTipAltitude, "outputTipAltitude", nullptr, },
+
+    // Localized distribution
+    { 0, 0, 0, 1, 0, 1, 1, ALL, 1, _bool,     0, & settings.useLocalizedDistribution, "useLocalizedDistribution", nullptr, },
+    { 0, 0, 0, 1, 0, 1, 1, ALL, 1, _uint8_t,  0, & settings.localizedDistributionTileLevel, "localizedDistributionTileLevel", nullptr, },
+    { 0, 0, 0, 1, 0, 1, 1, ALL, 1, _bool,     0, & settings.useAssistNow, "useAssistNow", nullptr, },
+
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.requestKeyUpdate, "requestKeyUpdate", nullptr, },
+
+    // LoRa
+    { 0, 0, 0, 0, 0, 1, 0, ALL, 0, _bool,     3, & settings.debugLora, "debugLora", nullptr, },
+    { 1, 1, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.enableLora, "enableLora", nullptr, },
+    { 1, 1, 0, 0, 0, 1, 0, ALL, 0, _float,    3, & settings.loraCoordinationFrequency, "loraCoordinationFrequency", nullptr, },
+    { 0, 1, 0, 0, 0, 1, 0, ALL, 0, _bool,     0, & settings.loraSaveSettingsToFlash, "loraSaveSettingsToFlash", nullptr, },
+    { 1, 1, 0, 0, 0, 1, 0, NON, 0, _int,      0, & settings.loraSerialInteractionTimeout_s, "loraSerialInteractionTimeout", nullptr, },
+    { 0, 1, 0, 0, 0, 1, 0, ALL, 0, _int,      0, & settings.loraTransmitGain_dB, "loraTransmitGain", nullptr, },
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+#ifdef  COMPILE_LG290P
+    { 1, 1, 1, 0, 0, 0, 1, L29, 1, tLgConst,  MAX_LG290P_CONSTELLATIONS, & settings.lg290pConstellations, "constellation_", gnssCmdUpdateConstellations, },
+    { 0, 1, 1, 0, 0, 0, 1, L29, 1, tLgMRNmea, MAX_LG290P_NMEA_MSG, & settings.lg290pMessageRatesNMEA, "messageRateNMEA_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 0, 0, 1, L29, 1, tLgMRBaRT, MAX_LG290P_RTCM_MSG, & settings.lg290pMessageRatesRTCMBase, "messageRateRTCMBase_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 0, 0, 1, L29, 1, tLgMRRvRT, MAX_LG290P_RTCM_MSG, & settings.lg290pMessageRatesRTCMRover, "messageRateRTCMRover_", gnssCmdUpdateMessageRates, },
+    { 0, 1, 1, 0, 0, 0, 1, L29, 1, tLgMRPqtm, MAX_LG290P_PQTM_MSG, & settings.lg290pMessageRatesPQTM, "messageRatePQTM_", gnssCmdUpdateMessageRates, },
+    { 1, 1, 0, 0, 0, 0, 1, L29, 1, _uint16_t, 0, & settings.lg290pRtkDifferentialAge, "lg290pRtkDifferentialAge", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, L29, 1, _uint16_t, 0, & settings.lg290pRtkDifferentialSourceType, "lg290pRtkDifferentialSourceType", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, L29, 1, _uint16_t, 0, & settings.lg290pRtkReliabilityLevel, "lg290pRtkReliabilityLevel", nullptr, },
+#endif  // COMPILE_LG290P
+
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugSettings, "debugSettings", nullptr, },
+    { 1, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.enableNtripCaster, "enableNtripCaster", nullptr, },
+    { 0, 1, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.baseCasterOverride, "baseCasterOverride", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _bool,     0, & settings.debugCLI, "debugCLI", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint16_t, 0, & settings.cliBlePrintDelay_ms, "cliBlePrintDelay", nullptr, },
+    { 0, 0, 0, 1, 1, 1, 1, ALL, 1, _uint32_t, 0, & settings.gnssConfigureRequest, "gnssConfigureRequest", nullptr, },
+
+    { 1, 1, 0, 0, 0, 1, 1, HAS, 1, _int,      0, & settings.pppMode, "pppMode", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, HAS, 1, _int,      0, & settings.pppDatum, "pppDatum", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, HAS, 1, _int,      0, & settings.pppTimeout, "pppTimeout", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, HAS, 1, _float,    2, & settings.pppHorizontalConvergence, "pppHorizontalConvergence", nullptr, },
+    { 1, 1, 0, 0, 0, 0, 1, HAS, 1, _float,    2, & settings.pppVerticalConvergence, "pppVerticalConvergence", nullptr, },
+
+    // Add new settings to appropriate group above or create new group
+    // Then also add to the same group in settings above
+
+//                F
+//    i           a
+//    n  i        c
+//    W  n  u     e
+//    e  C  s     t     P  F    T
+//    b  o  e           o  a    o
+//    C  m  S     M     s  c    r
+//    o  m  u     o  T  t  e    c
+//    n  a  f     s  o  c  t    h
+//    f  n  f  E  a  r  a
+//    i  d  i  v  i  c  r  F    X
+//    g  s  x  k  c  h  d  P    2  Type       Qual                Variable                  Name              afterSetCmd
+    /*
+    { 1, 1, 0, 1, 1, 1, 1, 1, ALL, 1,     0, & settings., ""},
+    */
+};
+
+const int numRtkSettingsEntries = sizeof(rtkSettingsEntries) / sizeof(rtkSettingsEntries)[0];
+
+// Indicate which peripherals are present on a given platform
+struct struct_present
+{
+    bool psram_2mb = false;
+    bool psram_4mb = false;
+
+    bool cellular_lara = false;
+    bool ethernet_ws5500 = false;
+    bool radio_lora = false;
+    bool gnss_to_uart = false;
+    bool gnss_to_uart2 = false;
+
+    bool gnss_um980 = false;
+    bool gnss_zedf9p = false;
+    bool gnss_mosaicX5 = false; // L-Band is implicit
+    bool gnss_lg290p = false;
+    bool gnss_zedx20p = false;
+
+    // A GNSS TP interrupt - for accurate clock setting
+    // The GNSS UBX PVT message is sent ahead of the top-of-second
+    // The rising edge of the TP signal indicates the true top-of-second
+    bool timePulseInterrupt = false;
+
+    bool imu_im19 = false;
+    bool imu_zedf9r = false;
+
+    bool microSd = false;
+    bool mosaicMicroSd = false;
+    bool microSdCardDetectLow = false; // Card detect low = SD in place
+    bool microSdCardDetectHigh = false; // Card detect high = SD in place
+    bool microSdCardDetectGpioExpanderHigh = false; // Card detect on GPIO5, high = SD in place
+
+    bool i2c0BusSpeed_400 = false;
+    bool i2c1BusSpeed_400 = false;
+    bool i2c1 = false;
+    bool display_i2c0 = false;
+    bool display_i2c1 = false;
+    DisplayType display_type = DISPLAY_MAX_NONE;
+    bool displayInverted = false;
+
+    bool fuelgauge_max17048 = false;
+    bool fuelgauge_bq40z50 = false;
+    bool charger_mp2762a = false;
+    bool charger_mcp73833 = false;
+
+    bool beeper = false;
+    bool encryption_atecc608a = false;
+    bool portDataMux = false;
+    bool peripheralPowerControl = false;
+    bool laraPowerControl = false;
+    bool antennaShortOpen = false;
+
+    bool button_mode = false; // EVK has a dedicated Mode button but no power
+    bool button_function = false; // Facet FP has both power and Function buttons
+    bool button_powerHigh = false; // Button is pressed when high
+    bool button_powerLow = false; // Button is pressed when low
+    bool gpioExpanderButtons = false; // Available on Portability shield
+    bool fastPowerOff = false;
+    bool invertedFastPowerOff = false; // Needed for Facet mosaic v11
+
+    bool needsExternalPpl = false;
+
+    bool pppCapable = false; // Device has the capability to do PPP corrections, currently B2b or E6 HAS
+    bool multipathMitigation = false; // UM980 has MPM, other platforms do not
+    bool minCN0 = false; // ZED, mosaic, UM980 have minCN0. LG290P does on version >= v5.
+    bool minElevation = false; // ZED, mosaic, UM980 have minElevation. LG290P does on versions >= v5.
+    bool dynamicModel = false; // ZED, mosaic, UM980 have dynamic models. LG290P does with firmware v2.01.
+    bool gpioExpanderSwitches = false; // Used on Facet FP
+    bool loraDedicatedUart = false; // Platforms may have a dedicated or shared UART interface to the LoRa radio
+
+    const char *gnssUpdatePort = ""; // "CH342 Channel A" etc.
+
+    bool rtcm1033AntennaDescription = false; // RTCM 1033 Antenna Descriptor - supported on X5, LG290P and UM980
+} present;
+
+// Monitor which devices on the device are on or offline.
+struct struct_online
+{
+    bool batteryCharger_mp2762a = false;
+    bool batteryFuelGauge = false;
+    bool bluetooth = false;
+    bool powerButton = false;
+    bool functionButton = false;
+    bool display = false;
+    bool ethernetNTPServer = false; // EthernetUDP
+    bool fs = false;
+    bool gnss = false;
+    bool gpioExpanderButtons = false;
+    bool gpioExpanderSwitches = false;
+    bool httpClient = false;
+    bool i2c = false;
+    bool lband_gnss = false;
+    bool pointPerfectKeysApplied = false;
+    bool logging = false;
+    bool microSD = false;
+    bool mqttClient = false;
+    bool ntripClient = false;
+    bool ntripServer[NTRIP_SERVER_MAX] = {false, false, false, false};
+    bool otaClient = false;
+    bool ppl = false;
+    bool psram = false;
+    bool radio_lora = false;
+    bool rtc = false;
+    bool serialOutput = false;
+    bool tcpClient = false;
+    bool tcpServer = false;
+    bool udpServer = false;
+    bool webServer = false;
+    bool authenticationCoPro = false; // MFi authentication
+    bool imu_im19 = false;
+} online;
+
+typedef uint8_t NetIndex_t;     // Index into the networkInterfaceTable
+typedef uint32_t NetMask_t;      // One bit for each network interface
+typedef int8_t NetPriority_t;  // Index into networkPriorityTable
+                                // Value 0 (highest) - 255 (lowest) priority
+
+// Types of networks, these values must be in the same order as the
+// entries in networkInterfaceTable since they are used as indexes into
+// that table!
+enum NetworkTypes
+{
+    NETWORK_NONE = -1,  // The values below must start at zero and be sequential
+    NETWORK_ETHERNET,       // 0
+    NETWORK_WIFI_STATION,   // 1
+    NETWORK_CELLULAR,       // 2
+    // Add new networks above this line in default priority order
+    NETWORK_ANY,            // 3
+    NETWORK_MAX = NETWORK_ANY,
+
+    // Reserved: Only used to manage mDNS
+    NETWORK_WIFI_AP         // 4
+};
+
+#ifdef  COMPILE_NETWORK
+
+// Routine to poll a network interface
+// Inputs:
+//     index: Index into the networkInterfaceTable
+//     parameter: Arbitrary parameter to the poll routine
+typedef void (* NETWORK_POLL_ROUTINE)(NetIndex_t index, uintptr_t parameter, bool debug);
+
+// Sequence entry specifying a poll routine call for a network interface
+typedef const struct _NETWORK_POLL_SEQUENCE
+{
+    NETWORK_POLL_ROUTINE routine; // Address of poll routine, nullptr at end of table
+    uintptr_t parameter;          // Parameter passed to poll routine
+    const char * description;     // Description of operation
+} NETWORK_POLL_SEQUENCE;
+
+// Sequence table declarations
+extern NETWORK_POLL_SEQUENCE wifiStartSequence[];
+extern NETWORK_POLL_SEQUENCE wifiStopSequence[];
+extern NETWORK_POLL_SEQUENCE laraBootSequence[];
+extern NETWORK_POLL_SEQUENCE laraOffSequence[];
+extern NETWORK_POLL_SEQUENCE laraOnSequence[];
+
+typedef void (* NETWORK_UPDATE_METHOD)();
+extern void ethernetUpdate();
+extern void wifiStationUpdate();
+
+// networkInterfaceTable entry
+typedef struct _NETWORK_TABLE_ENTRY
+{
+    NetworkInterface * netif;           // Network interface object address
+    bool mDNS;                          // Set true to use mDNS service
+    NetIndex_t index;                   // Table index, also default priority
+    uint8_t pdState;                    // Periodic display state value
+    NETWORK_POLL_SEQUENCE * boot;       // Boot sequence, may be nullptr
+    NETWORK_POLL_SEQUENCE * start;      // Start sequence (Off --> On), may be nullptr
+    NETWORK_POLL_SEQUENCE * stop;       // Stop routine (On --> Off), may be nullptr
+    const char * name;                  // Name of the network interface
+    bool * present;                     // Address of present bool or nullptr if always available
+    NETWORK_UPDATE_METHOD updateMethod; // Update method
+} NETWORK_TABLE_ENTRY;
+
+// List of networks in default priority order!  These entries must match
+// the index values in the NetworkTypes enumeration!
+//
+// Only one network is turned on at a time. The start routine is called
+// as the priority drops to that level. The stop routine is called as the
+// priority rises above that level. The priority will continue to fall or
+// rise until a network is found that is online.
+NETWORK_TABLE_ENTRY networkInterfaceTable[] =
+{ //     Interface  mDNS    Index                   Periodic State      Boot Sequence           Start Sequence      Stop Sequence       Name                    Present                   Update method
+    #ifdef COMPILE_ETHERNET
+        {&ETH,      true,   NETWORK_ETHERNET,       PD_ETHERNET_STATE,  nullptr,                nullptr,            nullptr,            "Ethernet",             &present.ethernet_ws5500, ethernetUpdate},
+    #else
+        {nullptr,   false,  NETWORK_ETHERNET,       PD_ETHERNET_STATE,  nullptr,                nullptr,            nullptr,            "Ethernet-NotCompiled", nullptr,                  nullptr},
+    #endif  // COMPILE_ETHERNET
+
+    #ifdef COMPILE_WIFI
+        {&WiFi.STA, true,   NETWORK_WIFI_STATION,   PD_WIFI_STATE,      nullptr,                nullptr,            nullptr,            "WiFi Station",         nullptr,                  wifiStationUpdate},
+    #else
+        {nullptr,   false,  NETWORK_WIFI_STATION,   PD_WIFI_STATE,      nullptr,                nullptr,            nullptr,            "WiFi-NotCompiled",     nullptr,                  nullptr},
+    #endif  // COMPILE_WIFI
+
+    #ifdef  COMPILE_CELLULAR
+        {&PPP,      false,  NETWORK_CELLULAR,       PD_CELLULAR_STATE,  laraBootSequence,       laraOnSequence,     laraOffSequence,    "Cellular",             &present.cellular_lara,   nullptr},
+    #else
+        {nullptr,   false,  NETWORK_CELLULAR,       PD_CELLULAR_STATE,  nullptr,                nullptr,            nullptr,            "Cellular-NotCompiled", nullptr,                  nullptr},
+    #endif  // COMPILE_CELLULAR
+};
+const int networkInterfaceTableEntries = sizeof(networkInterfaceTable) / sizeof(networkInterfaceTable[0]);
+
+#define NETWORK_OFFLINE     networkInterfaceTableEntries
+
+const NetMask_t mDNSUse = 0x3; // One bit per network interface
+
+#endif //  COMPILE_NETWORK
+
+// Monitor which tasks are running.
+struct struct_tasks
+{
+    volatile bool gnssUartPinnedTaskRunning = false;
+    volatile bool i2cDetectTaskRunning = false;
+    volatile bool i2cPinnedTaskRunning = false;
+    volatile bool bluetoothCommandTaskRunning = false;
+    volatile bool btReadTaskRunning = false;
+    volatile bool buttonCheckTaskRunning = false;
+    volatile bool gnssReadTaskRunning = false;
+    volatile bool handleGnssDataTaskRunning = false;
+    volatile bool idleTask0Running = false;
+    volatile bool idleTask1Running = false;
+    volatile bool sdSizeCheckTaskRunning = false;
+    volatile bool updatePplTaskRunning = false;
+    volatile bool updateWebServerTaskRunning = false;
+
+    bool bluetoothCommandTaskStopRequest = false;
+    bool btReadTaskStopRequest = false;
+    bool buttonCheckTaskStopRequest = false;
+    bool gnssReadTaskStopRequest = false;
+    bool handleGnssDataTaskStopRequest = false;
+    bool sdSizeCheckTaskStopRequest = false;
+    bool updatePplTaskStopRequest = false;
+    bool updateWebServerTaskStopRequest = false;
+
+    volatile bool endDirectConnectMode = false; // Set true by e.g. button task
+} task;
+
+#ifdef COMPILE_NETWORK
+// AWS certificate for PointPerfect API
+static const char *AWS_PUBLIC_CERT = R"=====(
+-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+)=====";
+
+// ISRG Root X1 (Let's Encrypt). Used to validate raw.githubusercontent.com's server cert chain.
+static const char GITHUB_RAW_PUBLIC_CERT[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)EOF";
+
+#endif  // COMPILE_NETWORK
+
+//****************************************
+// WiFi class
+//****************************************
+
+typedef uint8_t WIFI_CHANNEL_t;
+
+#ifdef COMPILE_NETWORK
+#ifdef COMPILE_WIFI
+
+typedef uint32_t WIFI_ACTION_t;
+
+// Class to simplify WiFi handling
+class RTK_WIFI
+{
+  private:
+
+    int16_t _apCount;           // The number or remote APs detected in the WiFi network
+    IPAddress _apDnsAddress;    // DNS IP address to use while translating names into IP addresses
+    IPAddress _apFirstDhcpAddress;  // First IP address to use for DHCP
+    IPAddress _apGatewayAddress;// IP address of the gateway to the larger network (internet?)
+    IPAddress _apIpAddress;     // IP address of the soft AP
+    uint8_t _apMacAddress[6];   // MAC address of the soft AP
+    IPAddress _apSubnetMask;    // Subnet mask for soft AP
+    volatile bool _scanRunning; // Scan running
+    int _staAuthType;           // Authorization type for the remote AP
+    bool _staConnected;         // True when station is connected
+    bool _staHasIp;             // True when station has IP address
+    IPAddress _staIpAddress;    // IP address of the station
+    uint8_t _staIpType;         // 4 or 6 when IP address is assigned
+    volatile uint8_t _staMacAddress[6]; // MAC address of the station
+    const char * _staRemoteApSsid;      // SSID of remote AP
+    const char * _staRemoteApPassword;  // Password of remote AP
+    volatile WIFI_ACTION_t _started;    // Components that are started and running
+    bool _usingDefaultChannel;  // Using default WiFi channel
+    bool _verbose;              // True causes more debug output to be displayed
+
+    // Display components begin started or stopped
+    // Inputs:
+    //   text: Text describing the component list
+    //   components: A bit mask of the components
+    void displayComponents(const char * text, WIFI_ACTION_t components);
+
+    // Set the WiFi mode
+    // Inputs:
+    //   setMode: Modes to set
+    //   xorMode: Modes to toggle
+    //
+    // Math: result = (mode | setMode) ^ xorMode
+    //
+    //                              setMode
+    //                      0                   1
+    //  xorMode 0       No change           Set bit
+    //          1       Toggle bit          Clear bit
+    //
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool setWiFiMode(uint8_t setMode, uint8_t xorMode);
+
+    // Set the WiFi radio protocols
+    // Inputs:
+    //   interface: Interface on which to set the protocols
+    //   enableWiFiProtocols: When true, enable the WiFi protocols
+    //   enableLongRangeProtocol: When true, enable the long range protocol
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool setWiFiProtocols(wifi_interface_t interface,
+                          bool enableWiFiProtocols,
+                          bool enableLongRangeProtocol);
+
+    // Handle the soft AP events
+    // Inputs:
+    //   event: Arduino ESP32 event number found on
+    //          https://github.com/espressif/arduino-esp32
+    //          in libraries/Network/src/NetworkEvents.h
+    //   info: Additional data about the event
+    void softApEventHandler(arduino_event_id_t event, arduino_event_info_t info);
+
+    // Set the soft AP host name
+    // Inputs:
+    //   hostName: Zero terminated host name character string
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool softApSetHostName(const char * hostName);
+
+    // Set the soft AP configuration
+    // Inputs:
+    //   ipAddress: IP address of the server, nullptr or empty string causes
+    //              default 192.168.4.1 to be used
+    //   subnetMask: Subnet mask for local network segment, nullptr or empty
+    //              string causes default 0.0.0.0 to be used, unless ipAddress
+    //              is not specified, in which case 255.255.255.0 is used
+    //   gatewayAddress: Gateway to internet IP address, nullptr or empty string
+    //            causes default 0.0.0.0 to be used (no access to internet)
+    //   dnsAddress: Domain name server (name to IP address translation) IP address,
+    //              nullptr or empty string causes 0.0.0.0 to be used (only
+    //              mDNS name translation, if started)
+    //   dhcpStartAddress: Start of DHCP IP address assignments for the local
+    //              network segment, nullptr or empty string causes default
+    //              0.0.0.0 to be used (disable DHCP server)  unless ipAddress
+    //              was not specified in which case 192.168.4.2
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool softApSetIpAddress(const char * ipAddress,
+                            const char * subnetMask,
+                            const char * gatewayAddress,
+                            const char * dnsAddress,
+                            const char * dhcpFirstAddress);
+
+    // Set the soft AP SSID and password
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool softApSetSsidPassword(const char * ssid, const char * password);
+
+    // Connect to an access point
+    // Outputs:
+    //   Return true if the connection was successful and false upon failure.
+    bool stationConnectAP();
+
+    // Disconnect the station from an AP
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool stationDisconnect();
+
+    // Handle the WiFi station events
+    // Inputs:
+    //   event: Arduino ESP32 event number found on
+    //          https://github.com/espressif/arduino-esp32
+    //          in libraries/Network/src/NetworkEvents.h
+    //   info: Additional data about the event
+    void stationEventHandler(arduino_event_id_t event, arduino_event_info_t info);
+
+    // Set the station's host name
+    // Inputs:
+    //   hostName: Zero terminated host name character string
+    // Outputs:
+    //   Returns true if successful and false upon failure
+    bool stationHostName(const char * hostName);
+
+    // Start the WiFi scan
+    // Inputs:
+    //   channel: Channel number for the scan, zero (0) scan all channels
+    // Outputs:
+    //   Returns the number of access points
+    int16_t stationScanForAPs(WIFI_CHANNEL_t channel);
+
+    // Select the AP and channel to use for WiFi station
+    // Inputs:
+    //   apCount: Number to APs detected by the WiFi scan
+    //   list: Determine if the APs should be listed
+    // Outputs:
+    //   Returns the channel number of the AP
+    WIFI_CHANNEL_t stationSelectAP(uint8_t apCount, bool list);
+
+    // Handle the WiFi event
+    // Inputs:
+    //   event: Arduino ESP32 event number found on
+    //          https://github.com/espressif/arduino-esp32
+    //          in libraries/Network/src/NetworkEvents.h
+    //   info: Additional data about the event
+    void wifiEvent(arduino_event_id_t event, arduino_event_info_t info);
+
+  public:
+    char * _apSsid; // SSID for the soft AP
+
+    // Constructor
+    // Inputs:
+    //   verbose: Set to true to display additional WiFi debug data
+    RTK_WIFI(bool verbose = false);
+
+    // Clear some of the started components
+    // Inputs:
+    //   components: Bitmask of components to clear
+    // Outputs:
+    //   Returns the bitmask of started components
+    WIFI_ACTION_t clearStarted(WIFI_ACTION_t components);
+
+    // Attempts a connection to all provided SSIDs
+    // Inputs:
+    //    timeout: Number of milliseconds to wait for the connection
+    //    startAP: Set true to start AP mode, false does not change soft AP
+    //             status
+    // Outputs:
+    //    Returns true if successful and false upon timeout, no matching
+    //    SSID or other failure
+    bool connect(unsigned long timeout,
+                 bool startAP);
+
+    // Enable or disable the WiFi modes
+    // Inputs:
+    //   enableESPNow: Enable ESP-NOW mode
+    //   enableSoftAP: Enable soft AP mode
+    //   enableStataion: Enable station mode
+    //   fileName: Name of file calling the enable routine
+    //   lineNumber: Line number in the file calling the enable routine
+    // Outputs:
+    //   Returns true if the modes were successfully configured
+    bool enable(bool enableESPNow,
+                bool enableSoftAP,
+                bool enableStation,
+                const char * fileName,
+                int lineNumber);
+
+    // Get the ESP-NOW status
+    // Outputs:
+    //   Returns true when ESP-NOW is online and ready for use
+    bool espNowOnline();
+
+    // Handle the WiFi event
+    // Inputs:
+    //   event: Arduino ESP32 event number found on
+    //          https://github.com/espressif/arduino-esp32
+    //          in libraries/Network/src/NetworkEvents.h
+    //   info: Additional data about the event
+    void eventHandler(arduino_event_id_t event, arduino_event_info_t info);
+
+    // Get the current WiFi channel
+    // Outputs:
+    //   Returns the current WiFi channel number
+    WIFI_CHANNEL_t getChannel();
+
+    // Configure the soft AP
+    // Inputs:
+    //   ipAddress: IP address of the soft AP
+    //   subnetMask: Subnet mask for the soft AP network
+    //   firstDhcpAddress: First IP address to use in the DHCP range
+    //   dnsAddress: IP address to use for DNS lookup (translate name to IP address)
+    //   gatewayAddress: IP address of the gateway to a larger network (internet?)
+    // Outputs:
+    //   Returns true if the soft AP was successfully configured.
+    bool softApConfiguration(IPAddress ipAddress,
+                             IPAddress subnetMask,
+                             IPAddress firstDhcpAddress,
+                             IPAddress dnsAddress,
+                             IPAddress gateway);
+
+    // Display the soft AP configuration
+    // Inputs:
+    //   display: Address of a Print object
+    void softApConfigurationDisplay(Print * display);
+
+    // Get the soft AP IP address
+    // Returns the soft IP address
+    IPAddress softApIpAddress();
+
+    // Get the soft AP status
+    // Outputs:
+    //   Returns true when the soft AP is ready for use
+    bool softApOnline();
+
+    // Attempt to start the soft AP mode
+    // Inputs:
+    //    forceAP: Set to true to force AP to start, false will only start
+    //             soft AP if settings.wifiConfigOverAP is true
+    // Outputs:
+    //    Returns true if the soft AP was started successfully and false
+    //    otherwise
+    bool startAp(bool forceAP);
+
+    // Get the WiFi station IP address
+    // Returns the IP address of the WiFi station
+    IPAddress stationIpAddress();
+
+    // Get the station status
+    // Outputs:
+    //   Returns true when the WiFi station is online and ready for use
+    bool stationOnline();
+
+    // Get the SSID of the remote AP
+    const char * stationSsid();
+
+    // Stop and start WiFi components
+    // Inputs:
+    //   stopping: WiFi components that need to be stopped
+    //   starting: WiFi components that neet to be started
+    // Outputs:
+    //   Returns true if the modes were successfully configured
+    bool stopStart(WIFI_ACTION_t stopping, WIFI_ACTION_t starting);
+
+    // Test the WiFi modes
+    // Inputs:
+    //   testDurationMsec: Milliseconds to run each test
+    void test(uint32_t testDurationMsec);
+
+    // Enable or disable verbose debug output
+    // Inputs:
+    //   enable: Set true to enable verbose debug output
+    // Outputs:
+    //   Return the previous enable value
+    bool verbose(bool enable);
+
+    // Verify the WiFi tables
+    void verifyTables();
+};
+
+#endif // COMPILE_WIFI
+#endif // COMPILE_NETWORK
+
+//----------------------------------------
+// Hardware connections
+//----------------------------------------
+
+#define PIN_UNDEFINED -1
+
+// These pins are set in beginBoard()
+int pin_debug = PIN_UNDEFINED;              // LED on EVK
+int pin_batteryStatusLED = PIN_UNDEFINED;   // LED on Torch
+int pin_baseStatusLED = PIN_UNDEFINED;      // LED on EVK
+int pin_bluetoothStatusLED = PIN_UNDEFINED; // LED on Torch
+int pin_gnssStatusLED = PIN_UNDEFINED;      // LED on Torch
+
+int pin_muxA = PIN_UNDEFINED;
+int pin_muxB = PIN_UNDEFINED;
+int pin_mux1 = PIN_UNDEFINED;
+int pin_mux2 = PIN_UNDEFINED;
+int pin_mux3 = PIN_UNDEFINED;
+int pin_mux4 = PIN_UNDEFINED;
+
+int pin_modeButton = PIN_UNDEFINED;   // Mode button on EVK, Function button on Facet FP
+int pin_powerButton = PIN_UNDEFINED;  // Power and general purpose button on Torch, Facet
+int pin_powerFastOff = PIN_UNDEFINED; // Output on Facet
+int pin_muxDAC = PIN_UNDEFINED;
+int pin_muxADC = PIN_UNDEFINED;
+int pin_peripheralPowerControl = PIN_UNDEFINED; // EVK and Facet mosaic
+
+int pin_GnssEvent = PIN_UNDEFINED;   // Facet mosaic
+int pin_GnssOnOff = PIN_UNDEFINED;   // Facet mosaic
+int pin_chargerLED = PIN_UNDEFINED;  // Facet mosaic
+int pin_chargerLED2 = PIN_UNDEFINED; // Facet mosaic
+int pin_GnssReady = PIN_UNDEFINED;   // Facet mosaic
+
+int pin_loraRadio_reset = PIN_UNDEFINED;
+int pin_loraRadio_boot = PIN_UNDEFINED;
+int pin_loraRadio_power = PIN_UNDEFINED;
+
+int pin_Ethernet_CS = PIN_UNDEFINED;
+int pin_Ethernet_Interrupt = PIN_UNDEFINED;
+int pin_GNSS_CS = PIN_UNDEFINED;
+int pin_GNSS_TimePulse = PIN_UNDEFINED;
+int pin_GNSS_Reset = PIN_UNDEFINED;
+
+// microSD card pins
+int pin_PICO = PIN_UNDEFINED;
+int pin_POCI = PIN_UNDEFINED;
+int pin_SCK = PIN_UNDEFINED;
+int pin_microSD_CardDetect = PIN_UNDEFINED;
+int pin_microSD_CS = PIN_UNDEFINED;
+
+int pin_I2C0_SDA = PIN_UNDEFINED;
+int pin_I2C0_SCL = PIN_UNDEFINED;
+
+// On EVK, Display is on separate I2C bus
+int pin_I2C1_SDA = PIN_UNDEFINED;
+int pin_I2C1_SCL = PIN_UNDEFINED;
+
+int pin_GnssUart_RX = PIN_UNDEFINED;
+int pin_GnssUart_TX = PIN_UNDEFINED;
+
+int pin_GnssUart2_RX = PIN_UNDEFINED;
+int pin_GnssUart2_TX = PIN_UNDEFINED;
+
+int pin_Cellular_RX = PIN_UNDEFINED;
+int pin_Cellular_TX = PIN_UNDEFINED;
+int pin_Cellular_PWR_ON = PIN_UNDEFINED;
+int pin_Cellular_Network_Indicator = PIN_UNDEFINED;
+int pin_Cellular_Reset = PIN_UNDEFINED;
+int pin_Cellular_RTS = PIN_UNDEFINED;
+int pin_Cellular_CTS = PIN_UNDEFINED;
+
+int pin_GNSS_DR_Reset = PIN_UNDEFINED;
+
+int pin_IMU_RX = PIN_UNDEFINED;
+int pin_IMU_TX = PIN_UNDEFINED;
+int pin_IMU_Boot = PIN_UNDEFINED;
+
+int pin_powerAdapterDetect = PIN_UNDEFINED;
+int pin_usbSelect = PIN_UNDEFINED;
+int pin_beeper = PIN_UNDEFINED;
+
+bool cellularModemResetLow = false;
+#define CELLULAR_MODEM_FC ESP_MODEM_FLOW_CONTROL_NONE
+uint8_t laraPwrLowValue;
+uint32_t laraTimer; // Backoff timer
+
+int pin_gpioExpanderInterrupt = PIN_UNDEFINED;
+const uint8_t gpioExpander_up = 0;
+const uint8_t gpioExpander_down = 1;
+const uint8_t gpioExpander_right = 2;
+const uint8_t gpioExpander_left = 3;
+const uint8_t gpioExpander_center = 4;
+const uint8_t gpioExpander_cardDetect = 5;
+const uint8_t gpioExpander_io6 = 6;
+const uint8_t gpioExpander_io7 = 7;
+
+const uint8_t gpioExpanderSwitch_S1 = 0; // Controls U16 switch 1: connect ESP UART0 to CH342 or SW2
+const uint8_t gpioExpanderSwitch_S2 = 1; // Controls U17 switch 2: connect SW1 to RS232 Output or GNSS UART4
+const uint8_t gpioExpanderSwitch_S3 = 2; // Controls U18 switch 3: connect ESP UART2 to GNSS UART3 or LoRa UART2
+const uint8_t gpioExpanderSwitch_S4 = 3; // Controls U19 switch 4: connect GNSS UART2 to 4-pin JST TTL Serial or LoRa UART0
+const uint8_t gpioExpanderSwitch_LoraEnable = 4; // LoRa_EN
+const uint8_t gpioExpanderSwitch_GNSS_Reset = 5; // RST_GNSS
+const uint8_t gpioExpanderSwitch_LoraBoot = 6;   // LoRa_BOOT0 - Used for bootloading the STM32 radio IC
+const uint8_t gpioExpanderSwitch_S5 = 7;         // Controls U61 switch 5: connect GNSS UART1 to Port A of CH342
+const uint8_t gpioExpanderNumSwitches = 8;
+
+bool usbSerialIsSelected = true;      // Goes false when switch U18 is moved from CH34x to LoRa
+
+//----------------------------------------
+// Peripherals
+//----------------------------------------
+
+#include <SparkFun_I2C_Expander_Arduino_Library.h> // Click here to get the library: http://librarymanager/All#SparkFun_I2C_Expander_Arduino_Library
+#include <SparkFun_IM19_IMU_Arduino_Library.h> //http://librarymanager/All#SparkFun_IM19_IMU
+#include <SparkFun_LG290P_GNSS.h> //http://librarymanager/All#SparkFun_LG290P
+#include <SparkFun_Unicore_GNSS_Arduino_Library.h> //http://librarymanager/All#SparkFun_Unicore_GNSS
+#include <SparkFun_u-blox_GNSS_v3.h> //http://librarymanager/All#SparkFun_u-blox_GNSS_v3
+#include <Wire.h>
+
+TwoWire * i2c_0;
+TwoWire * i2c_1;
+
+HardwareSerial *serialGNSS = nullptr;  // Don't instantiate until we know what gnssPlatform we're on
+HardwareSerial *serial2GNSS = nullptr; // Don't instantiate until we know what gnssPlatform we're on
+HardwareSerial *uart2Serial; // Shared serial port between LoRa and Tilt
+
+#define SerialForLoRa uart2Serial
+#define SerialForTilt uart2Serial
+
+//----------------------------------------
+// Time measurement
+//----------------------------------------
+
+#define HOURS_IN_A_DAY 24L
+#define MINUTES_IN_AN_HOUR 60L
+#define SECONDS_IN_A_MINUTE 60L
+#define MILLISECONDS_IN_A_SECOND 1000L
+#define MILLISECONDS_IN_A_MINUTE (SECONDS_IN_A_MINUTE * MILLISECONDS_IN_A_SECOND)
+#define MILLISECONDS_IN_AN_HOUR (MINUTES_IN_AN_HOUR * MILLISECONDS_IN_A_MINUTE)
+#define MILLISECONDS_IN_A_DAY (HOURS_IN_A_DAY * MILLISECONDS_IN_AN_HOUR)
+
+#define SECONDS_IN_AN_HOUR (MINUTES_IN_AN_HOUR * SECONDS_IN_A_MINUTE)
+#define SECONDS_IN_A_DAY (HOURS_IN_A_DAY * SECONDS_IN_AN_HOUR)
+
+//----------------------------------------
+// IM19 IMU
+//----------------------------------------
+
+enum Im19UpdateResult
+{
+    IM19_UPDATE_FAILED = 0,
+    IM19_UPDATE_SUCCESS,
+    IM19_UPDATE_RETRY, // IM19 reports lost frames - caller should re-request only those byte ranges and call again
+};
+
+//----------------------------------------
+// Over-The-Air (OTA) Updates
+//----------------------------------------
+
+#define OTA_DATA_TIMEOUT        (15 * MILLISECONDS_IN_A_SECOND)
+
+const char * otaEqualSigns = "==================================================";
+
+#define OTA_FIRMWARE_GITHUB_RAW "raw.githubusercontent.com"
+
+// Constants to parse GitHub directory listings
+const char * otaRawHead = "/raw/refs/heads/main";
+const char * otaTree = "},\"tree";
+const char * otaFileTree = ":{\"fileTree\":{\"";
+const char * otaItems = "\":{\"items\":[";
+const char * otaListEnd = "]";
+const char * otaName = "\"name\":\"";
+const char * otaNameEnd = "\"";
+
+bool otaDebugVerbose;
+uint32_t otaFileBytes;
+
+// Firmware Update menu developer options, serial menu only (see OTA_REQUEST_* in OTA.h).
+// A plain global rather than a Settings member - it must never be sticky/NVM, always
+// starts disabled at boot so a forgotten 'Always update' override can't silently persist.
+bool otaDeveloperOptions = false;
+
+#endif // __SETTINGS_H__

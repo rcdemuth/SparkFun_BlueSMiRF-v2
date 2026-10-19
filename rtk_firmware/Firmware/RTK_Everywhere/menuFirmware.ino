@@ -1,0 +1,829 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+menuFirmware.ino
+
+  This module implements the over-the-air (OTA) firmware update menu and update paths.
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+//----------------------------------------
+// Menu
+//----------------------------------------
+
+#ifdef COMPILE_MENU_FIRMWARE
+
+//----------------------------------------
+// Check for release candidate (RC) build
+//----------------------------------------
+bool firmwareCheckForRcBuild()
+{
+    bool rcBuild = (ENABLE_DEVELOPER || (FIRMWARE_VERSION_MAJOR >= 99));
+    return rcBuild;
+}
+
+//----------------------------------------
+// Update firmware if bin files found
+//----------------------------------------
+void firmwareMenu()
+{
+    OTA_SUBSYSTEM_MASK subsystemMask;
+
+    otaDebugVerbose = false;
+    subsystemMask = otaGetProductSubsystemSupport();
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Firmware Update");
+
+        char currentVersion[21];
+        bool rcBuild = firmwareCheckForRcBuild();
+        espFirmwareVersionGet(currentVersion, sizeof(currentVersion), rcBuild);
+        systemPrintf("Current firmware: %s\r\n", currentVersion);
+
+        // Display the OTA portion of the menu
+        // Note: Use otaMenuDisplay to get a new ESP32 image when the parsing
+        // fails in deviceFirmwareUpdate due to server website changes!
+        // Letters: a c d e i q u C D E F G I L O P S V 1... for files
+        otaMenuDisplay(subsystemMask, &otaDeveloperOptions, currentVersion);
+
+        for (int x = 0; x < binCount; x++)
+            systemPrintf("%d) Load SD file: %s\r\n", x + 1, binFileNames[x]);
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming > 0 && incoming < (binCount + 1))
+        {
+            // Adjust incoming to match array
+            incoming--;
+            microSDUpdateFirmware(binFileNames[incoming]);
+        }
+
+        // Note: Use otaMenuProcessInput to get a new ESP32 image when the
+        // parsing fails in deviceFirmwareUpdate due to server website
+        // changes!
+        else if (otaMenuProcessInput(subsystemMask, &otaDeveloperOptions, incoming))
+        {
+        }
+
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+#endif // COMPILE_MENU_FIRMWARE
+
+//----------------------------------------
+// Version number comes in as v2.7-Jan 5 2023
+// Given a char string, break into version number major/minor, year, month, day
+// Returns false if parsing failed
+//----------------------------------------
+bool firmwareVersionBreakIntoParts(char *version, int *versionNumberMajor, int *versionNumberMinor,
+                                   int *patch, int *revision, int *year, int *month, int *day)
+{
+    char monthStr[20];
+    int placed;
+
+    do
+    {
+        // Try major.minor-date.patch.revision-monthStr day year
+        *patch = 0;
+        *revision = 0;
+        *year = 0;
+        *month = 0;
+        *day = 0;
+        placed = sscanf(version, "%d.%d.%d.%d-%s %d %d",
+                        versionNumberMajor, versionNumberMinor, patch, revision,
+                        monthStr, day, year);
+        if (placed < 5)
+        {
+            // Fall back to major.minor-date format without patch/revision
+            *patch = 0;
+            *revision = 0;
+            *year = 0;
+            *month = 0;
+            *day = 0;
+            placed = sscanf(version, "%d.%d-%s %d %d",
+                            versionNumberMajor, versionNumberMinor,
+                            monthStr, day, year);
+        }
+        if (placed < 5)
+        {
+            // Fall back to version built by espFirmwareVersionFormat
+            *patch = 0;
+            *revision = 0;
+            *year = 0;
+            *month = 0;
+            *day = 0;
+            placed = sscanf(version, "%d.%d-%d-%s-%d",
+                            versionNumberMajor, versionNumberMinor,
+                            monthStr, day, year);
+        }
+        if (placed >= 5)
+        {
+            // Validate the month
+            (*month) = firmwareVersionMapMonthName(monthStr);
+            if (*month != -1)
+                return true;
+        }
+
+        // Fall back to major.minor.patch.revision
+        *patch = 0;
+        *revision = 0;
+        *year = 0;
+        *month = 0;
+        *day = 0;
+        placed = sscanf(version, "%d.%d.%d.%d",
+                        versionNumberMajor, versionNumberMinor, patch, revision);
+        if (placed >= 2)
+            return true;
+    } while (0);
+
+    log_d("Failed to sscanf basic");
+    return false;
+}
+
+//----------------------------------------
+// Format the firmware version
+//----------------------------------------
+void espFirmwareVersionFormat(uint8_t major, uint8_t minor, char *buffer, int bufferLength, bool includeDate)
+{
+    char prefix;
+
+    // Construct the full or release candidate version number
+    prefix = (ENABLE_DEVELOPER || (major >= 99)) ? 'd' : 'v';
+    if ((prefix == 'd') && (bufferLength >= 21))
+        // 123456789012345678901
+        // pxxx.yyy-dd-mmm-yyyy0
+        snprintf(buffer, bufferLength, "%c%d.%d-%s", prefix, major, minor, __DATE__);
+
+    // Construct a truncated version number
+    else if (bufferLength >= 9)
+        // 123456789
+        // pxxx.yyy0
+        snprintf(buffer, bufferLength, "%c%d.%d", prefix, major, minor);
+
+    // The buffer is too small for the version number
+    else
+    {
+        systemPrintf("ERROR: Buffer too small for version number!\r\n");
+        if (bufferLength > 0)
+            *buffer = 0;
+    }
+}
+
+//----------------------------------------
+// Get the current firmware version
+//----------------------------------------
+bool otaEsp32GetVersion(int &major, int &minor, int &patch, int &revision, int &releaseCandidate)
+{
+    major = FIRMWARE_VERSION_MAJOR;
+    minor = FIRMWARE_VERSION_MINOR;
+    patch = 0;
+    revision = 0;
+    releaseCandidate = (ENABLE_DEVELOPER || (major >= 99));
+    return true;
+}
+
+//----------------------------------------
+// Get the current firmware version
+//----------------------------------------
+void espFirmwareVersionGet(char *buffer, int bufferLength, bool includeDate)
+{
+    espFirmwareVersionFormat(FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, buffer, bufferLength, includeDate);
+}
+
+// Returns string containing the current version number - ie "v2.0"
+const char *printEspFirmwareVersion()
+{
+    // Create the firmware version string
+    static char espFirmwareVersion[86];
+    bool rcBuild = firmwareCheckForRcBuild();
+    espFirmwareVersionGet(espFirmwareVersion, sizeof(espFirmwareVersion), rcBuild);
+
+    return ((const char *)espFirmwareVersion);
+}
+
+// Returns a string containing the module model, firmware, and ID. Similar to gnss->printModuleInfo()
+const char *printGnssModuleInfo()
+{
+    static char gnssModuleInfo[80];
+    char gnssMfg[10];
+    if (present.gnss_zedf9p)
+        strncpy(gnssMfg, "ZED-F9P", sizeof(gnssMfg));
+    else if (present.gnss_zedx20p)
+        strncpy(gnssMfg, "ZED-X20P", sizeof(gnssMfg));
+    else if (present.gnss_um980)
+        strncpy(gnssMfg, "UM980", sizeof(gnssMfg));
+    else if (present.gnss_mosaicX5)
+        strncpy(gnssMfg, "mosaic-X5", sizeof(gnssMfg));
+    else if (present.gnss_lg290p)
+        strncpy(gnssMfg, "LG290P", sizeof(gnssMfg));
+
+    snprintf(gnssModuleInfo, sizeof(gnssModuleInfo), "%s Firmware: %s ID: %s", gnssMfg, gnssFirmwareVersion,
+             gnssUniqueId);
+
+    return ((const char *)gnssModuleInfo);
+}
+
+// Returns the GNSS firmware string for the web settings tab
+const char *printGnssFirmwareInfo()
+{
+    static char gnssFirmwareInfo[80];
+
+    snprintf(gnssFirmwareInfo, sizeof(gnssFirmwareInfo), "GNSS Firmware: %s", gnssFirmwareVersion);
+
+    return ((const char *)gnssFirmwareInfo);
+}
+
+//----------------------------------------
+// Returns true if otaReportedVersion is newer than currentVersion
+// Version number comes in as v2.7-Jan 5 2023
+// 2.7-Jan 5 2023 is newer than v2.7-Jan 1 2023
+// We can't use just the float number: v3.12 is a greater version than v3.9 but it is a smaller float number
+//----------------------------------------
+bool firmwareVersionIsReportedNewer(char *reportedVersion, char *currentVersion)
+{
+    int currentVersionNumberMajor = 0;
+    int currentVersionNumberMinor = 0;
+    int currentVersionNumberPatch = 0;
+    int currentVersionNumberRevision = 0;
+    int currentDay = 0;
+    int currentMonth = 0;
+    int currentYear = 0;
+    bool currentRc = false;
+
+    int reportedVersionNumberMajor = 0;
+    int reportedVersionNumberMinor = 0;
+    int reportedVersionNumberPatch = 0;
+    int reportedVersionNumberRevision = 0;
+    int reportedDay = 0;
+    int reportedMonth = 0;
+    int reportedYear = 0;
+    bool reportedRc = false;
+
+    firmwareVersionBreakIntoParts(currentVersion, &currentVersionNumberMajor, &currentVersionNumberMinor,
+                                  &currentVersionNumberPatch, &currentVersionNumberRevision, &currentYear,
+                                  &currentMonth, &currentDay);
+    currentRc = (currentYear != 0);
+    firmwareVersionBreakIntoParts(reportedVersion, &reportedVersionNumberMajor, &reportedVersionNumberMinor,
+                                  &reportedVersionNumberPatch, &reportedVersionNumberRevision, &reportedYear,
+                                  &reportedMonth, &reportedDay);
+    reportedRc = (reportedYear != 0);
+
+    if (settings.debugFirmwareUpdate)
+    {
+        systemPrintf("currentVersion (%s): %d.%d.%d.%d %d %d %d\r\n", currentVersion, currentVersionNumberMajor,
+                     currentVersionNumberMinor, currentVersionNumberPatch, currentVersionNumberRevision, currentYear,
+                     currentMonth, currentDay);
+        systemPrintf("reportedVersion (%s): %d.%d.%d.%d %d %d %d\r\n", reportedVersion, reportedVersionNumberMajor,
+                     reportedVersionNumberMinor, reportedVersionNumberPatch, reportedVersionNumberRevision,
+                     reportedYear, reportedMonth, reportedDay);
+    }
+
+    // Production firmware is named "2.6" or "4.11.1.2"
+    // Release Candidate firmware is named "2.6-Dec 5 2022"
+
+    // Check version number
+    if ((reportedVersionNumberMajor > currentVersionNumberMajor)
+        || (currentVersionNumberMajor == 99))
+        return (true);
+    if (reportedVersionNumberMajor == currentVersionNumberMajor &&
+        reportedVersionNumberMinor > currentVersionNumberMinor)
+        return (true);
+    if (reportedVersionNumberMajor == currentVersionNumberMajor &&
+        reportedVersionNumberMinor == currentVersionNumberMinor &&
+        reportedVersionNumberPatch > currentVersionNumberPatch)
+        return (true);
+    if (reportedVersionNumberMajor == currentVersionNumberMajor &&
+        reportedVersionNumberMinor == currentVersionNumberMinor &&
+        reportedVersionNumberPatch == currentVersionNumberPatch &&
+        reportedVersionNumberRevision > currentVersionNumberRevision)
+        return (true);
+
+    // For RC firmware, compare firmware date as well
+    // Check which date is more recent
+    // https://stackoverflow.com/questions/5283120/date-comparison-to-find-which-is-bigger-in-c
+    int reportedVersionScore = ((reportedYear > 100) ? reportedYear : reportedYear + 2000)
+                             + (reportedMonth * 100) + reportedDay;
+    int currentVersionScore = ((currentYear > 100) ? currentYear : currentYear + 2000)
+                             + (currentMonth * 100) + currentDay;
+
+    return (reportedVersionScore > currentVersionScore);
+}
+
+//----------------------------------------
+// https://stackoverflow.com/questions/21210319/assign-month-name-and-integer-values-from-string-using-sscanf
+//----------------------------------------
+int firmwareVersionMapMonthName(char *mmm)
+{
+    static char const *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    for (size_t i = 0; i < sizeof(months) / sizeof(months[0]); i++)
+    {
+        if (strcmp(mmm, months[i]) == 0)
+            return i + 1;
+    }
+    return -1;
+}
+
+#ifdef COMPILE_FIRMWARE_UPDATE
+//----------------------------------------
+// Firmware update code
+//----------------------------------------
+
+//----------------------------------------
+// Mount the SD card and then perform the firmware update
+//----------------------------------------
+void microSDMountThenUpdate(const char *firmwareFileName)
+{
+    bool gotSemaphore;
+    bool wasSdCardOnline;
+
+    // Try to gain access the SD card
+    gotSemaphore = false;
+    wasSdCardOnline = online.microSD;
+    if (online.microSD != true)
+        beginSD();
+
+    if (online.microSD != true)
+        systemPrintln("microSD card is offline!");
+    else
+    {
+        // Attempt to access file system. This avoids collisions with file writing from other functions like
+        // recordSystemSettingsToFile() and gnssSerialReadTask()
+        if (xSemaphoreTake(sdCardSemaphore, fatSemaphore_longWait_ms) == pdPASS)
+        {
+            gotSemaphore = true;
+            microSDUpdateFirmware(firmwareFileName);
+        } // End Semaphore check
+        else
+        {
+            systemPrintf("sdCardSemaphore failed to yield, menuFirmware.ino line %d\r\n", __LINE__);
+        }
+    }
+
+    // Release access the SD card
+    if (online.microSD && (!wasSdCardOnline))
+        endSD(gotSemaphore, true);
+    else if (gotSemaphore)
+        xSemaphoreGive(sdCardSemaphore);
+}
+
+//----------------------------------------
+// Looks for matching binary files in root
+// Loads a global called binCount
+// Called from beginSD with microSD card mounted and sdCardsemaphore held
+//----------------------------------------
+void microSDScanForFirmware()
+{
+    // Count available binaries
+    SdFile tempFile;
+    SdFile dir;
+    const char *BIN_EXT = "bin";
+    const char *BIN_HEADER = "RTK_Everywhere_Firmware";
+
+    char fname[50]; // Handle long file names
+
+    dir.open("/"); // Open root
+
+    binCount = 0; // Reset count in case microSDScanForFirmware is called again
+
+    while (tempFile.openNext(&dir, O_READ) && binCount < maxBinFiles)
+    {
+        if (tempFile.isFile())
+        {
+            tempFile.getName(fname, sizeof(fname));
+
+            if (strcmp(forceFirmwareFileName, fname) == 0)
+            {
+                systemPrintln("Forced firmware detected. Loading...");
+                displayForcedFirmwareUpdate();
+                microSDUpdateFirmware(forceFirmwareFileName);
+            }
+
+            // Check 'bin' extension
+            if (strcmp(BIN_EXT, &fname[strlen(fname) - strlen(BIN_EXT)]) == 0)
+            {
+                // Check for 'RTK_Everywhere_Firmware' start of file name
+                if (strncmp(fname, BIN_HEADER, strlen(BIN_HEADER)) == 0)
+                {
+                    strncpy(binFileNames[binCount++], fname, sizeof(binFileNames[0]) - 1); // Add this to the array
+                }
+                else
+                    systemPrintf("Unknown: %s\r\n", fname);
+            }
+        }
+        tempFile.close();
+    }
+}
+
+//----------------------------------------
+// Look for firmware file on SD card and update as needed
+// Called from microSDScanForFirmware with microSD card mounted and sdCardsemaphore held
+// Called from microSDMountThenUpdate with microSD card mounted and sdCardsemaphore held
+//----------------------------------------
+void microSDUpdateFirmware(const char *firmwareFileName)
+{
+    // Count app partitions
+    int appPartitions = countAppPartitions();
+
+    // We cannot do OTA if there is only one partition
+    if (appPartitions < 2)
+    {
+        systemPrintln(
+            "SD firmware updates are not available on 4MB devices. Please use the GUI or CLI update methods.");
+        return;
+    }
+
+    // Verify that the firmware file exists
+    if (!sd->exists(firmwareFileName))
+    {
+        systemPrintln("No firmware file found");
+        return;
+    }
+
+    // Verify that the SdFile object can be allocated
+    SdFile firmwareFile;
+
+    // Verify that the firmware file can be opened
+    if (!firmwareFile.open(firmwareFileName, O_READ))
+    {
+        systemPrintf("ERROR - Failed to open %s on the microSD card!\r\n", firmwareFileName);
+        return;
+    }
+
+    // Verify that something exists in the firmware file
+    size_t updateSize = firmwareFile.size();
+    if (updateSize == 0)
+    {
+        systemPrintln("Error: Binary is empty");
+        firmwareFile.close();
+        return;
+    }
+
+    // Turn off any tasks so that we are not disrupted
+    wifiEspNowOff(__FILE__, __LINE__);
+    wifiStopAll();
+    bluetoothEnd();
+
+    // Delete tasks if running
+    tasksStopGnssUart();
+
+    systemPrintf("Loading %s\r\n", firmwareFileName);
+
+    if (Update.begin(updateSize) == false)
+    {
+        systemPrintln("Update begin failed. Not enough partition space available.");
+        firmwareFile.close();
+        return;
+    }
+
+    systemPrintln("Moving file to OTA section");
+    systemPrint("Bytes to write: ");
+    systemPrint(updateSize);
+
+    const int pageSize = 512 * 4;
+    byte dataArray[pageSize];
+    int bytesWritten = 0;
+
+    // Indicate progress
+    int barWidthInCharacters = 20; // Width of progress bar, ie [###### % complete
+    long portionSize = updateSize / barWidthInCharacters;
+    int barWidth = 0;
+
+    // Bulk write from the SD file to flash
+    while (firmwareFile.available())
+    {
+        bluetoothLedBlink(); // Toggle LED to indicate activity
+
+        int bytesToWrite = pageSize; // Max number of bytes to read
+        if (firmwareFile.available() < bytesToWrite)
+            bytesToWrite = firmwareFile.available(); // Trim this read size as needed
+
+        firmwareFile.read(dataArray, bytesToWrite); // Read the next set of bytes from file into our temp array
+
+        if (Update.write(dataArray, bytesToWrite) != bytesToWrite)
+        {
+            systemPrintln("\nWrite failed. Binary may be incorrectly aligned.");
+            break;
+        }
+        else
+            bytesWritten += bytesToWrite;
+
+        // Indicate progress
+        if (bytesWritten > barWidth * portionSize)
+        {
+            // Advance the bar
+            barWidth++;
+            systemPrint("\n[");
+            for (int x = 0; x < barWidth; x++)
+                systemPrint("=");
+            systemPrintf("%d%%", bytesWritten * 100 / updateSize);
+            if (bytesWritten == updateSize)
+                systemPrintln("]");
+
+            displayFirmwareUpdateProgress(bytesWritten * 100 / updateSize);
+        }
+    }
+    systemPrintln("\nFile move complete");
+
+    if (Update.end())
+    {
+        if (Update.isFinished())
+        {
+            displayFirmwareUpdateProgress(100);
+
+            // Clear all settings from LittleFS
+            LittleFS.format();
+
+            systemPrintln("ESP32 updated successfully. Rebooting. Goodbye!");
+
+            // If forced firmware is detected, do a full reset of config as well
+            if (strcmp(forceFirmwareFileName, firmwareFileName) == 0)
+            {
+                systemPrintln("Removing firmware file");
+
+                // Remove forced firmware file to prevent endless loading
+                firmwareFile.close();
+
+                if (removeFileSD(firmwareFileName, true) == false)
+                    systemPrintln("WARNING: Failed to remove forced firmware file from SD");
+                gnss->factoryReset();
+            }
+
+            delay(1000);
+            ESP.restart();
+        }
+        else
+            systemPrintln("Update not finished? Something went wrong!");
+    }
+    else
+    {
+        systemPrint("Error Occurred. Error #: ");
+        systemPrintln(String(Update.getError()));
+    }
+
+    firmwareFile.close();
+
+    displayMessage("Update Failed", 0);
+
+    systemPrintln("Firmware update failed. Please try again.");
+}
+
+//----------------------------------------
+//----------------------------------------
+void otaDisplayPercentage(int bytesWritten, int totalLength, bool alwaysDisplay)
+{
+    static int previousPercent = -1;
+    int percent = 100 * bytesWritten / totalLength;
+    if (alwaysDisplay || (percent != previousPercent))
+    {
+        // Indicate progress
+        int barWidthInCharacters = 20; // Width of progress bar, ie [###### % complete
+        long portionSize = totalLength / barWidthInCharacters;
+
+        // Indicate progress
+        systemPrint("\r\n[");
+        int barWidth = bytesWritten / portionSize;
+        for (int x = 0; x < barWidth; x++)
+            systemPrint("=");
+        systemPrintf(" %d%%", percent);
+        if (bytesWritten == totalLength)
+            systemPrintln("]");
+
+        // Display progress on the display
+        displayFirmwareUpdateProgress(percent);
+
+        // Report progress over the BLE Command Channel
+        char stringPercent[5];
+        snprintf(stringPercent, sizeof(stringPercent), "%d", percent);
+        commandSendStringOkResponse((char *)"SPEXE", (char *)"ESPUPDATEPROGRESS", stringPercent);
+
+        // Report progress to the Web Config socket
+        if (apConfigFirmwareUpdateInProcess == true)
+        {
+            char myProgress[50];
+            snprintf(myProgress, sizeof(myProgress), "espOtaFirmwareStatus,%d,", percent);
+            webServerSendString(myProgress);
+        }
+
+        previousPercent = percent;
+    }
+}
+
+//----------------------------------------
+// Reads packetBytes from an already-open HTTP stream and feeds them to the device,
+// reporting progress as it goes.
+//
+// The generic process is:
+// 1) Call the updateFirmwareBegin function to erase the flash on the device
+// 2) Call firmwareUpdateProgressReset to initialize the progress bar and set
+//    the file size
+// 3) Loop reading firmware from the stream and writing it to the device, call
+//    firmwareUpdateProgressCallback to update the progress bar
+// 4) Call the updateFirmwareEnd function to complete the flash write operation
+// 5) Display the flash write status
+//----------------------------------------
+bool otaEsp32StreamFirmware(const char * chip,
+                            NetworkClient * stream,
+                            size_t fileBytes,
+                            uint32_t expectedCrc,
+                            uint8_t * buffer,
+                            size_t packetBytes)
+{
+    bool success;
+
+    do
+    {
+        success = false;
+
+        // Display the parameters
+        if (settings.debugFirmwareUpdate && otaDebugVerbose)
+        {
+            systemPrintf("fileBytes: %d\r\n", fileBytes);
+            systemPrintf("expectedCrc: 0x%08x\r\n", expectedCrc);
+            systemPrintf("packetBytes: %d\r\n", packetBytes);
+        }
+
+        systemPrintf("Starting %s firmware update...\r\n", chip);
+
+        // Enter the bootloader and erase flash before opening the GitHub connection.
+        if (Update.begin(fileBytes) == false)
+        {
+            systemPrintf("ERROR: %s failed to enter bootloader mode.\r\n", chip);
+            break;
+        }
+        systemPrintf("%s is in bootloader mode.\r\n", chip);
+
+        // Initialize the progress bar
+        firmwareUpdateProgressReset(fileBytes);
+
+        // Compute the CRC across the entire file
+        uint32_t crc = 0;
+
+        // Loop until all data has been transferred or another error occurs.
+        // HTTPS conections remain open even after the data has been transferred
+        // and HTTP connections close after data has been transferred but some
+        // may still be available.  Only test the network connection when no
+        // data is available.
+        unsigned long lastDataTime = millis();
+        size_t validData = 0;
+        while (fileBytes > 0)
+        {
+            // Wait until some data is available
+            size_t availableBytes = stream->available();
+            if (availableBytes == 0)
+            {
+                // Verify network connection
+                if (stream->connected() == false)
+                {
+                    systemPrintln("ERROR: lost connection to network server");
+                    break;
+                }
+
+                // Check for network timeout
+                if ((millis() - lastDataTime) > OTA_DATA_TIMEOUT)
+                {
+                    systemPrintf("ERROR: Timed out waiting for data\r\n");
+                    break;
+                }
+                yield();
+                continue;
+            }
+            if (settings.debugFirmwareUpdate && otaDebugVerbose)
+                systemPrintf("availableBytes: %d\r\n", availableBytes);
+
+            // Read the received data
+            size_t bytesToRead = min(availableBytes, packetBytes - validData);
+            int bytesRead = stream->readBytes(&buffer[validData], bytesToRead);
+            if (settings.debugFirmwareUpdate && otaDebugVerbose)
+                systemPrintf("bytesRead: %d\r\n", bytesRead);
+            if (bytesRead <= 0)
+            {
+                systemPrintln("ERROR: Failed reading data from network");
+                break;
+            }
+            validData += bytesRead;
+
+            // Fill the packet
+            if ((validData < packetBytes) && (validData != fileBytes))
+                continue;
+
+            // Compute the CRC
+            crc = crc32Compute(crc, buffer, validData);
+
+            // Validate the computed CRC matches the expected CRC
+            if ((fileBytes == validData) && (crc != expectedCrc))
+            {
+                systemPrintf("Expected CRC: 0x%08x, File CRC: 0x%08x\r\n",
+                             expectedCrc, crc);
+                systemPrintf("ERROR: File has changed, CRC does not match!\r\n");
+                break;
+            }
+
+            // Update this portion of the firmware
+            if (Update.write(buffer, validData) != validData)
+            {
+                systemPrintln("ERROR: Failed during write");
+                break;
+            }
+
+            // Display the progress
+            firmwareUpdateProgressCallback(chip, validData);
+
+            // Account for this data
+            fileBytes -= validData;
+            lastDataTime = millis();
+            validData = 0;
+        }
+        if (fileBytes)
+            break;
+
+        // Complete the flash update transaction
+        if (Update.end() == false)
+        {
+            systemPrintf("ERROR: %s update.end failed. Error #: %s\r\n",
+                         chip, String(Update.getError()).c_str());
+            break;
+        }
+
+        if (Update.isFinished() == false)
+        {
+            systemPrintf("ERROR: %s update not finished? Something went wrong!\r\n", chip);
+            break;
+        }
+
+        systemPrintf("%s update successfully completed.\r\n", chip);
+        success = true;
+    } while (0);
+
+    if (fileBytes && settings.debugFirmwareUpdate)
+        systemPrintf("fileBytes: %d\r\n", fileBytes);
+
+    // Display the firmware update status
+    systemPrintln(otaEqualSigns);
+    if (success)
+        systemPrintf("%s firmware update completed successfully\r\n", chip);
+    else
+        systemPrintf("%s firmware update failed!\r\n", chip);
+    systemPrintln(otaEqualSigns);
+
+    return success;
+}
+
+// Given a relative location, return the full GitHub raw URL for the firmware file.
+char *otaGetGithubFileLocation(const char *relativeFirmwareFileLocation)
+{
+    // The relative file location looks like "\imu\im19\20260302210315_VH2_B2.2_A11.1_6bf04becee0bda310e65d.enc"
+    // We need to access
+    // "https://raw.githubusercontent.com/sparkfun/SparkFun_RTK_Everywhere_Firmware_Binaries/main/imu/im19/20260522185649_VH2_B2.2_A11.4.1_131b44ecee0bdad5670c7.enc"
+
+    static char firmwareFileLocation[256];
+    snprintf(firmwareFileLocation, sizeof(firmwareFileLocation),
+             "https://%s/sparkfun/SparkFun_RTK_Everywhere_Firmware_Binaries/main%s", OTA_FIRMWARE_GITHUB_RAW,
+             relativeFirmwareFileLocation);
+
+    // Convert backslashes to forward slashes for URL formatting
+    for (char *c = firmwareFileLocation; *c != '\0'; c++)
+        if (*c == '\\')
+            *c = '/';
+
+    // if(settings.enabledebugFirmwareUpdate)
+    systemPrintf("Starting HTTP GET for firmware: %s\r\n", firmwareFileLocation);
+
+    return firmwareFileLocation;
+}
+
+// Returns true if we successfully establish a secure connection to GitHub.
+bool otaSecurelyConnectGitHub(WiFiClientSecure &client)
+{
+    client.setCACert(GITHUB_RAW_PUBLIC_CERT);
+
+    // Bound the connect/read/write and TLS handshake time so a stalled
+    // server fails fast instead of blocking on the library defaults
+    // (30 s socket / 120 s handshake).
+    client.setTimeout(10000);       // milliseconds: TCP connect + socket read/write
+    client.setHandshakeTimeout(15); // seconds: TLS handshake
+
+    // Preflight TLS handshake using the expected host name.
+    // With CA configured, connect() fails if certificate validation fails.
+    if (!client.connect(OTA_FIRMWARE_GITHUB_RAW, 443))
+    {
+        systemPrintln("TLS socket connect failed");
+        return false;
+    }
+
+    // if (settings.debugFirmwareUpdate)
+    systemPrintln("TLS certificate verified for raw.githubusercontent.com");
+
+    client.stop();
+    return true;
+}
+
+#endif // COMPILE_FIRMWARE_UPDATE

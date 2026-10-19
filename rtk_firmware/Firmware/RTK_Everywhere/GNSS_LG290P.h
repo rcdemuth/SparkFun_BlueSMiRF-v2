@@ -1,0 +1,611 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+GNSS_LG290P.h
+
+  Declarations and definitions for the LG290P GNSS receiver and the GNSS_LG290P class
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+#ifndef __GNSS_LG290P_H__
+#define __GNSS_LG290P_H__
+
+#ifdef COMPILE_LG290P
+
+#include <SparkFun_LG290P_GNSS.h> //http://librarymanager/All#SparkFun_LG290P
+
+// Keep count of the number of RTCM messages received on the correction port
+// so we can tell if the port is receiving corrections
+uint32_t lg290pRTCMCorrectionCountPrevious = 0;
+uint32_t lg290pRTCMCorrectionCountCurrent = 0;
+
+// Constellations monitored/used for fix
+// Available constellations: GPS, BDS, GLO, GAL, QZSS, NavIC
+const char *lg290pConstellationNames[] = {
+    "GPS", "GLONASS", "Galileo", "BeiDou", "QZSS", "NavIC",
+};
+
+#define MAX_LG290P_CONSTELLATIONS (6)
+
+// Struct to describe support messages on the LG290P
+typedef struct
+{
+    const char msgTextName[strlen("PQTMGEOFENCESTATUS") + 1]; // Printable/Human readable name
+    const int
+        msgVersionOffset; // 'MsgVer' or 'Offset' for a given message. Varies depending on the message. -1 of omitted.
+    const int msgDefaultRate;           // Default rate for 'factory' settings
+    const int msgMaxRate;               // Maximum allowed N message rate
+    const bool msgIsEphemeris;          // True indicates message contains Ephemeris, set by PQTMCFGRTCM
+    const int firmwareVersionSupported; // The minimum version this message is supported.
+                                        // 0 = all versions.
+                                        // 104 = Supported in v1.4 and later
+} lg290pMsg;
+
+// Static array containing all the compatible messages
+// Rate = Output once every N position fix(es).
+const lg290pMsg lgMessagesNMEA[] = {
+    // In order from the LG29xP Series GNSS Protocol Spec v1.2.0 20260109, Table 6
+    {"RMC", -1, 1, 255, false, 0},   // Firmware v1.0 to v1.6, N = 1. v2.1, N = 0-255
+    {"GGA", -1, 1, 255, false, 0},   // No message version for NMEA
+    {"GSV", -1, 1, 255, false, 0},   //
+    {"GSA", -1, 1, 255, false, 0},   //
+    {"VTG", -1, 1, 255, false, 0},   //
+    {"GLL", -1, 1, 255, false, 0},   //
+    {"GBS", -1, 0, 255, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+    {"GNS", -1, 0, 255, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+    {"GST", -1, 1, 255, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+    {"ZDA", -1, 0, 255, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+    {"HDT", -1, 0, 255, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+    {"THS", -1, 0, 255, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+};
+
+const lg290pMsg lgMessagesRTCM[] = {
+    // In order from the LG29xP Series GNSS Protocol Spec v1.2.0 20260109, Table 6
+    {"RTCM3-1005", -1, 1, 1200, false, 0},   // RTCM-### must have only the rate (no msgVer/Offset)
+    {"RTCM3-1006", -1, 0, 1200, false, 0},   //
+    {"RTCM3-1033", -1, 0, 1200, false, 104}, // Added in v1.1.0 spec. Firmware v1.4 and above
+    {"RTCM3-107X", 0, 1, 1200, false, 0},    // RTCM3-###X Must have rate and msgVer/Offset = 0.
+    {"RTCM3-108X", 0, 1, 1200, false, 0},    //
+    {"RTCM3-109X", 0, 1, 1200, false, 0},    //
+    {"RTCM3-111X", 0, 1, 1200, false, 0},    //
+    {"RTCM3-112X", 0, 1, 1200, false, 0},    //
+    {"RTCM3-113X", 0, 1, 1200, false, 0},    //
+    {"RTCM3-1019", -1, 0, 7200, true, 0},    // Ephemeris: CFGMSGRATE must be 0 or 1; CFGRTCM sets the interval 0-7200
+    {"RTCM3-1020", -1, 0, 7200, true, 0},    //
+    {"RTCM3-1041", -1, 0, 7200, true, 0},    //
+    {"RTCM3-1042", -1, 0, 7200, true, 0},    //
+    {"RTCM3-1044", -1, 0, 7200, true, 0},    //
+    {"RTCM3-1046", -1, 0, 7200, true, 0},    //
+    {"RTCM3-1230", -1, 0, 7200, false, 201}, // Added in v1.2.0 spec. Firmware v2.1 and above. NOT Ephemeris!
+};
+
+// Quectel Proprietary messages
+// Any message type not identified here will not be allowed through the lg290pMessageEnabled() filter.
+const lg290pMsg lgMessagesPQTM[] = {
+    // In order from the LG29xP Series GNSS Protocol Spec v1.2.0 20260109, Table 6
+    {"PQTMEPE", 2, 0, 255, false, 0},            // msgVer = 2
+    {"PQTMVEL", 1, 0, 255, false, 0},            //
+    {"PQTMGEOFENCESTATUS", 1, 0, 255, false, 0}, //
+    {"PQTMTXT", 1, 0, 255, false, 0},            //
+    // {"PQTMSVINSTATUS", 1, 0, 255, false, 0},      // Only available in Base mode
+    {"PQTMPVT", 1, 0, 255, false, 0}, //
+    {"PQTMDOP", 1, 0, 255, false, 0}, //
+    {"PQTMPL", 1, 0, 255, false, 0},  //
+    {"PQTMODO", 1, 0, 255, false, 0}, //
+    // {"PQTMTAR", 1, 0, 255, false, 201},           // Only available on LG580P
+    {"PQTMNAV", 1, 0, 255, false, 201}, // Added in v1.2.0 spec. Firmware v2.1 and above.
+    {"PQTMEOE", 1, 0, 255, false, 201}, // Added in v1.2.0 spec. Firmware v2.1 and above.
+    // {"PQTMANTENNASTATUS", 1, 0, 255, false, 201}, // Only supported on LG580P
+    {"PQTMENV", 1, 0, 255, false, 201},           // Added in v1.2.0 spec. Firmware v2.1 and above.
+    {"PQTMRTCMIS", 1, 0, 1, false, 201},          // Added in v1.2.0 spec. Firmware v2.1 and above.
+    {"PQTMPPPNAV", 1, 0, 255, false, 201},        // Added in v1.2.0 spec. Firmware v2.1 and above.
+    {"PQTMJAMMINGSTATUS", 1, 0, 255, false, 201}, // Added in v1.2.0 spec. Firmware v2.1 and above.
+};
+
+#define MAX_LG290P_NMEA_MSG (sizeof(lgMessagesNMEA) / sizeof(lg290pMsg))
+#define MAX_LG290P_RTCM_MSG (sizeof(lgMessagesRTCM) / sizeof(lg290pMsg))
+#define MAX_LG290P_PQTM_MSG (sizeof(lgMessagesPQTM) / sizeof(lg290pMsg))
+
+enum lg290p_NavMode_e
+{
+    // PQTMCFGNAVMODE - added at firmware v2.01
+    // 0 = Normal mode. (Basic mode applied to most scenarios, for example, driving scenario)
+    // 5 = Dynamic flight mode (applied to Dynamic flight mode with equivalent dynamics range
+    //             and vertical acceleration on different flight phase)
+    // 11 = Mower mode (applied to mower application) (*** Default value on LG290P ***)
+    // 14 = Agriculture mode (applied to agriculture application)
+    LG290P_NAV_MODE_NORMAL = 0,
+    LG290P_NAV_MODE_DYNAMIC = 5,
+    LG290P_NAV_MODE_MOWER = 11,
+    LG290P_NAV_MODE_AGRICULTURE = 14,
+
+    LG290P_NUM_NAV_MODES = 4, // Change to match the total number of modes
+};
+
+typedef struct
+{
+    const uint8_t navMode;
+    const char name[15];
+} lg290pNavMode;
+
+const lg290pNavMode lg290pNavModes[] = {
+    {LG290P_NAV_MODE_NORMAL, "Normal"},
+    {LG290P_NAV_MODE_DYNAMIC, "Dynamic"},
+    {LG290P_NAV_MODE_MOWER, "Mower"},
+    {LG290P_NAV_MODE_AGRICULTURE, "Agriculture"},
+};
+
+#define MAX_LG290P_NAV_MODES (sizeof(lg290pNavModes) / sizeof(lg290pNavMode))
+
+class GNSS_LG290P : GNSS
+{
+  private:
+    LG290P *_lg290p; // Library class instance
+
+    int _externalCorrectionsEnabled[3] = { -1, -1, -1 }; // LG290P has UARTS 1-3
+
+  protected:
+    bool configureOnce();
+
+    // Setup the general configuration of the GNSS
+    // Not Rover or Base specific (ie, baud rates)
+    // Outputs:
+    //   Returns true if successfully configured and false upon failure
+    bool configure();
+
+    uint8_t getActiveNmeaMessageCount();
+
+    // Given the name of an NMEA message, return the array number
+    uint8_t getNmeaMessageNumberByName(const char *msgName);
+
+    // Given the name of an RTCM message, return the array number
+    uint8_t getRtcmMessageNumberByName(const char *msgName);
+
+    // Return true if the GPGGA message is active
+    bool isGgaActive();
+
+    // Given a sub type (ie "RTCM", "NMEA") present menu showing messages with this subtype
+    // Controls the messages that get broadcast over Bluetooth and logged (if enabled)
+    void menuMessagesSubtype(int *localMessageRate, const char *messageType);
+
+    // Set the minimum satellite signal level for navigation.
+    bool setMinCN0(uint8_t cnoValue);
+
+    // Given the name of a message, find it, and set the rate
+    bool setNmeaMessageRateByName(const char *msgName, uint8_t msgRate);
+
+    // Set all RTCM Rover message report rates to one value
+    void setRtcmRoverMessageRates(uint8_t msgRate);
+
+    // Given the name of a message, find it, and set the rate
+    bool setRtcmRoverMessageRateByName(const char *msgName, uint8_t msgRate);
+
+  public:
+    // Constructor
+    GNSS_LG290P() : GNSS()
+    {
+    }
+
+    // If we have decryption keys, configure module
+    void applyPointPerfectKeys();
+
+    // Set RTCM for base mode to defaults (1005/1074/1084/1094/1124 1Hz & 1230 0.1Hz)
+    void baseRtcmDefault();
+
+    // Reset to Low Bandwidth Link (1074/1084/1094/1124 0.5Hz & 1005/1230 0.1Hz)
+    void baseRtcmLowDataRate();
+
+    // Check if a given baud rate is supported by this module
+    bool baudIsAllowed(uint32_t baudRate);
+    uint32_t baudGetMinimum();
+    uint32_t baudGetMaximum();
+
+    // Connect to GNSS and identify particulars
+    void begin();
+
+    // Setup TM2 time stamp input as need
+    // Outputs:
+    //   Returns true when an external event occurs and false if no event
+    bool beginExternalEvent();
+
+    bool checkNMEARates();
+
+    bool checkPPPRates();
+
+    // Configure the Base
+    // Outputs:
+    //   Returns true if successfully configured and false upon failure
+    bool configureBase();
+
+    // Configure specific aspects of the receiver for NTP mode
+    bool configureNtpMode();
+
+    // Configure the Rover
+    // Outputs:
+    //   Returns true if successfully configured and false upon failure
+    bool configureRover();
+
+    // Configure the RTCM 1033 Antenna Description
+    // Outputs:
+    //   Returns true if successfully configured and false upon failure
+    bool configureRtcm1033();
+
+    // Responds with the messages supported on this platform
+    // Inputs:
+    //   returnText: String to receive message names
+    // Returns message names in the returnText string
+    void createMessageList(String &returnText);
+
+    // Responds with the RTCM/Base messages supported on this platform
+    // Inputs:
+    //   returnText: String to receive message names
+    // Returns message names in the returnText string
+    void createMessageListBase(String &returnText);
+
+    void debuggingDisable();
+
+    void debuggingEnable();
+
+    bool disableSurveyIn(bool saveAndReset);
+
+    bool enterConfigMode(unsigned long waitForSemaphoreTimeout_millis);
+
+    bool exitConfigMode();
+
+    // Restore the GNSS to the factory settings
+    void factoryReset();
+
+    uint16_t fileBufferAvailable();
+
+    uint16_t fileBufferExtractData(uint8_t *fileBuffer, int fileBytesToRead);
+
+    // Start the base using fixed coordinates
+    // Outputs:
+    //   Returns true if successfully started and false upon failure
+    bool fixedBaseStart();
+
+    bool fixRateIsAllowed(uint32_t fixRateMs);
+
+    // Return min/max rate in ms
+    uint32_t fixRateGetMinimumMs();
+
+    uint32_t fixRateGetMaximumMs();
+
+    // Return the number of active/enabled messages
+    uint8_t getActiveMessageCount();
+
+    // Return the number of active/enabled RTCM messages
+    uint8_t getActiveRtcmMessageCount();
+
+    // Return the number of active/enabled PQTM messages
+    uint8_t getActivePqtmMessageCount();
+
+    // Get the altitude
+    // Outputs:
+    //   Returns the altitude in meters or zero if the GNSS is offline
+    double getAltitude();
+
+    uint32_t getBaudRate(uint8_t uartNumber);
+
+    // Returns the carrier solution or zero if not online
+    uint8_t getCarrierSolution();
+
+    uint32_t getCommBaudRate();
+
+    uint32_t getDataBaudRate();
+
+    // Returns the day number or zero if not online
+    uint8_t getDay();
+
+    // Return the number of milliseconds since GNSS data was last updated
+    uint16_t getFixAgeMilliseconds();
+
+    // Returns the fix type or zero if not online
+    uint8_t getFixType();
+
+    // Returns the geoidal separation
+    double getGeoidalSeparation();
+
+    // Returns the hours of 24 hour clock or zero if not online
+    uint8_t getHour();
+
+    // Get the horizontal position accuracy
+    // Outputs:
+    //   Returns the horizontal position accuracy or zero if offline
+    float getHorizontalAccuracy();
+
+    const char *getId();
+
+    // Get the latitude value
+    // Outputs:
+    //   Returns the latitude value or zero if not online
+    double getLatitude();
+
+    // Query GNSS for current leap seconds
+    uint8_t getLeapSeconds();
+
+    // Return the type of logging that matches the enabled messages - drives the logging icon
+    uint8_t getLoggingType();
+
+    // Get the longitude value
+    // Outputs:
+    //   Returns the longitude value or zero if not online
+    double getLongitude();
+
+    // Returns two digits of milliseconds or zero if not online
+    uint8_t getMillisecond();
+
+    // Returns minutes or zero if not online
+    uint8_t getMinute();
+
+    // Returns 0 - Unknown, 1 - Rover, 2 - Base
+    uint8_t getMode();
+
+    // Returns month number or zero if not online
+    uint8_t getMonth();
+
+    // Returns nanoseconds or zero if not online
+    uint32_t getNanosecond();
+
+    uint32_t getRadioBaudRate();
+
+    // Returns the seconds between solutions
+    double getRateS();
+
+    const char *getRtcmDefaultString();
+
+    const char *getRtcmLowDataRateString();
+
+    // Returns the number of satellites in view or zero if offline
+    uint8_t getSatellitesInView();
+
+    // Returns seconds or zero if not online
+    uint8_t getSecond();
+
+    // Get the survey-in mean accuracy
+    // Outputs:
+    //   Returns the mean accuracy or zero (0)
+    float getSurveyInMeanAccuracy();
+
+    uint8_t getSurveyInMode();
+
+    // Return the number of seconds the survey-in process has been running
+    int getSurveyInObservationTime();
+
+    // Returns timing accuracy or zero if not online
+    uint32_t getTimeAccuracy();
+
+    // Sets the pieces of the version number
+    bool getVersion(uint16_t &major, uint8_t &minor, uint8_t &patch, uint8_t &revision);
+
+    // Returns full year, ie 2023, not 23.
+    uint16_t getYear();
+
+    // Helper functions for the current mode as read from the GNSS receiver
+    bool gnssInBaseFixedMode();
+    bool gnssInBaseSurveyInMode();
+    bool gnssInRoverMode();
+
+    // Indicate if there are any additional settings specific to this GNSS
+    // This governs setGnssSpecificConfiguration() and menuGnssSpecificConfiguration()
+    bool hasGnssSpecificConfiguration();
+
+    bool isBlocking();
+
+    // Date is confirmed once we have GNSS fix
+    bool isConfirmedDate();
+
+    // Date is confirmed once we have GNSS fix
+    bool isConfirmedTime();
+
+    // Return true if GNSS receiver has a higher quality DGPS fix than 3D
+    bool isDgpsFixed();
+
+    // Returns 0 if corrections can not be arriving on the selected port
+    // Returns 1 if corrections are assumed to be arriving on the selected port
+    // Returns 2 if corrections truly are arriving on the selected port
+    // Firmware < v2.01 will return 0 or 1
+    // Firmware >= v2.01 will return 0 or 2
+    int isExternalCorrectionActive(uint8_t port);
+
+    // Some functions merely need to know if we have an RTK Float.
+    // This function checks to see if the given platform has reached sufficient
+    // fix type to be considered valid.
+    bool isFixed();
+
+    // Used in tpISR() for time pulse synchronization
+    bool isFullyResolved();
+
+    bool isPppConverged();
+
+    bool isPppConverging();
+
+    // Some functions merely need to know if we have an RTK Float.
+    // This function checks to see if the given platform has reached sufficient
+    // fix type to be considered valid.
+    bool isRTKFix();
+
+    // Some functions merely need to know if we have an RTK Float.
+    // This function checks to see if the given platform has reached sufficient
+    // fix type to be considered valid.
+    bool isRTKFloat();
+
+    // Determine if the survey-in operation is complete
+    // Outputs:
+    //   Returns true if the survey-in operation is complete and false
+    //   if the operation is still running
+    bool isSurveyInComplete();
+
+    // Date will be valid if the RTC is reporting (regardless of GNSS fix)
+    bool isValidDate();
+
+    // Time will be valid if the RTC is reporting (regardless of GNSS fix)
+    bool isValidTime();
+
+    // Controls the constellations that are used to generate a fix and logged
+    void menuConstellations();
+
+    // Configure any settings specific to this GNSS
+    void menuGnssSpecificConfiguration();
+
+    void menuMessageBaseRtcm();
+
+    // Control the messages that get broadcast over Bluetooth and logged (if enabled)
+    void menuMessages();
+
+    // Print the module type and firmware version
+    void printModuleInfo();
+
+    // Send correction data to the GNSS
+    // Inputs:
+    //   dataToSend: Address of a buffer containing the data
+    //   dataLength: The number of valid data bytes in the buffer
+    // Outputs:
+    //   Returns the number of correction data bytes written
+    int pushRawData(uint8_t *dataToSend, int dataLength);
+
+    // Hardware or software reset the GNSS
+    bool reset();
+
+    uint16_t rtcmBufferAvailable();
+
+    // If LBand is being used, ignore any RTCM that may come in from the GNSS
+    void rtcmOnGnssDisable();
+
+    // If L-Band is available, but encrypted, allow RTCM through other sources (radio, ESP-NOW) to GNSS receiver
+    void rtcmOnGnssEnable();
+
+    uint16_t rtcmRead(uint8_t *rtcmBuffer, int rtcmBytesToRead);
+
+    // Save the current configuration
+    // Outputs:
+    //   Returns true when the configuration was saved and false upon failure
+    bool saveConfiguration();
+
+    bool setBaudRate(uint8_t uartNumber, uint32_t baudRate);
+
+    bool setBaudRateComm(uint32_t baudRate);
+
+    bool setBaudRateData(uint32_t baudRate);
+
+    bool setBaudRateRadio(uint32_t baudRate);
+
+    // Enable all the valid constellations and bands for this platform
+    bool setConstellations();
+
+    // Enable / disable external corrections protocol(s) on the chosen port
+    // Always update if force is true. Otherwise, only update if enable has changed state
+    bool setExternalCorrections(uint8_t port, bool enable, bool force, const char *debug = nullptr);
+
+    // Set the elevation in degrees
+    // Inputs:
+    //   elevationDegrees: The elevation value in degrees
+    bool setElevation(uint8_t elevationDegrees);
+
+    // Configure any additional settings specific to this GNSS
+    bool setGnssSpecificConfiguration();
+
+    bool setPppService();
+
+    // Configure any logging settings - currently mosaic-X5 specific
+    bool setLogging();
+
+    // Set the NMEA messages
+    bool setMessagesNMEA();
+
+    // Set then RTCM Base messages
+    bool setMessagesRTCMBase();
+
+    // Set the RTCM Rover messages
+    bool setMessagesRTCMRover();
+
+    // Turn on all the enabled Extra/Other messages
+    bool setMessagesOther();
+
+    // Set the dynamic model to use for RTK
+    // Inputs:
+    //   modelNumber: Number of the model to use, provided by radio library
+    bool setModel(uint8_t modelNumber);
+
+    bool setMultipathMitigation(bool enableMultipathMitigation);
+
+    // Setup the PPS pin for PPS LED
+    bool setPPS();
+
+    // Specify the interval between solutions
+    // Inputs:
+    //   secondsBetweenSolutions: Number of seconds between solutions
+    // Outputs:
+    //   Returns true if the rate was successfully set and false upon
+    //   failure
+    bool setRate(double secondsBetweenSolutions);
+
+    // Enable/disable any output needed for tilt compensation
+    bool setTilt();
+
+    bool standby();
+
+    // Reset the survey-in operation
+    // Outputs:
+    //   Returns true if the survey-in operation was reset successfully
+    //   and false upon failure
+    bool surveyInReset();
+
+    // Start the survey-in operation
+    // Outputs:
+    //   Return true if successful and false upon failure
+    bool surveyInStart();
+
+    // If we have received serial data from the LG290P outside of the library (ie, from processUart1Message task)
+    // we can pass data back into the LG290P library to allow it to update its own variables
+    void lg290pUpdate(uint8_t *incomingBuffer, int bufferLength);
+
+    // Poll routine to update the GNSS state
+    void update();
+
+    /**
+     * @brief Reboot the module into bootloader mode, negotiate sync, query bootloader version,
+     *        send firmware metadata, and erase flash.
+     * @param firmwareSize total byte length of the firmware file (pre-computed by caller)
+     * @param firmwareCrc32 CRC32 of the firmware file (pre-computed via initFirmwareCrc32 / computeFirmwareCrc32)
+     * @param skipSoftwareReset set to true to skip PQTMSRR if the GNSS has been reset externally
+     * @return true when the device is erased and ready to receive firmware packets
+     */
+    bool updateFirmwareBegin(size_t firmwareSize, uint32_t firmwareCrc32, bool skipSoftwareReset = false);
+
+    /**
+     * @brief Feed the next chunk of firmware bytes to the module.
+     * @details Accumulates bytes into a 4096-byte buffer; sends a complete packet and waits
+     *          for ACK each time the buffer fills.
+     * @param data pointer to firmware bytes
+     * @param bytesToWrite number of bytes in data
+     * @return true on success, false on protocol error
+     */
+    bool updateFirmware(const uint8_t *data, size_t bytesToWrite);
+
+    /**
+     * @brief Flush any remaining buffered bytes as a final (partial) firmware packet.
+     * @return true if the last packet was accepted, false on error
+     */
+    bool updateFirmwareEnd();
+
+    /**
+     * @brief Send the firmware reset command then poll for up to 15 seconds for the module
+     *        to boot into the new firmware.
+     * @param maxWaitSeconds maximum number of seconds to wait for the module to respond
+     * @return true when the module responds to normal NMEA commands
+     */
+    bool updateFirmwareIsFinished(uint8_t maxWaitSeconds);
+};
+
+// Forward routine declarations
+bool lg290pCommandList(RTK_Settings_Types type, int settingsIndex, bool inCommands, int qualifier, char *settingName,
+                       size_t settingNameSize, char *settingValue);
+void lg290pCommandTypeJson(JsonArray &command_types);
+bool lg290pCreateString(RTK_Settings_Types type, int settingsIndex, char *newSettings);
+bool lg290pGetSettingValue(RTK_Settings_Types type, const char *suffix, int qualifier, int settingsIndex,
+                           char *settingValueStr);
+bool lg290pIsPresentOnFacetFP();
+void lg290pNewClass();
+bool lg290pNewSettingValue(struct Settings * tempSettings, RTK_Settings_Types type, const char *suffix, int qualifier, double d);
+bool lg290pSettingsToFile(char * line, size_t lineSize, RTK_Settings_Types type, int settingsIndex);
+
+#endif // COMPILE_LG290P
+#endif // __GNSS_LG290P_H__

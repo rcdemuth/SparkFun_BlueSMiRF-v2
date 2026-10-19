@@ -1,0 +1,734 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+menuMain.ino
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+#ifdef COMPILE_SERIAL_MENUS
+
+// Display the main menu configuration options
+void menuMain()
+{
+    // Redirect menu output, status and debug messages to the USB serial port
+    forwardGnssDataToUsbSerial = false;
+
+    inMainMenu = true;
+
+    // Clear forceMenuExit on entering the menu, to prevent dropping straight
+    // through if the BT connection was dropped while we had the menu closed
+    forceMenuExit = false;
+
+    displaySerialConfig(); // Display 'Serial Config' while user is configuring
+
+    if (settings.debugGnss == true)
+    {
+        // Turn off GNSS debug while in config menus
+        gnss->debuggingDisable();
+    }
+
+    while (1)
+    {
+        systemPrintln();
+        char versionString[21];
+        espFirmwareVersionGet(versionString, sizeof(versionString), true);
+        systemPrintf("%s %s%s %s\r\n", getBrandAttributeFromProductVariant(productVariant)->name,
+                     productVariantProperties->rtkPrefix ? "RTK " : "", platformPrefix, versionString);
+        systemPrintf("Mode: %s\r\n", stateToRtkMode(systemState));
+
+#ifdef COMPILE_BT
+
+        if (settings.bluetoothRadioType == BLUETOOTH_RADIO_SPP_AND_BLE)
+        {
+            systemPrint("** Bluetooth SPP and BLE broadcasting as: ");
+            systemPrint(deviceName);
+        }
+        else if (settings.bluetoothRadioType == BLUETOOTH_RADIO_SPP)
+        {
+            systemPrint("** Bluetooth SPP broadcasting as: ");
+            systemPrint(deviceName);
+        }
+        else if (settings.bluetoothRadioType == BLUETOOTH_RADIO_BLE)
+        {
+            systemPrint("** Bluetooth Low-Energy broadcasting as: ");
+            systemPrint(deviceName);
+        }
+        else if (settings.bluetoothRadioType == BLUETOOTH_RADIO_OFF)
+        {
+            systemPrint("** Bluetooth Turned Off");
+        }
+        systemPrintln(" **");
+#else  // COMPILE_BT
+        systemPrintln("** Bluetooth Not Compiled **");
+#endif // COMPILE_BT
+
+        systemPrintln("Menu: Main");
+
+        systemPrintln("1) Configure GNSS Receiver");
+
+        systemPrintln("2) Configure GNSS Messages");
+
+        systemPrintln("3) Configure Base");
+
+        systemPrintln("4) Configure Ports");
+
+        if (productVariant != RTK_TORCH) // Torch does not have logging
+            systemPrintln("5) Configure Logging");
+
+#ifdef COMPILE_WIFI
+        systemPrintln("6) Configure WiFi");
+#else  // COMPILE_WIFI
+        systemPrintln("6) **WiFi Not Compiled**");
+#endif // COMPILE_WIFI
+
+#ifdef COMPILE_NETWORK
+        systemPrintln("7) Configure TCP/UDP");
+#else  // COMPILE_NETWORK
+        systemPrintln("7) **TCP/UDP Not Compiled**");
+#endif // COMPILE_NETWORK
+
+#ifdef COMPILE_ETHERNET
+        if (present.ethernet_ws5500 == true)
+            systemPrintln("e) Configure Ethernet");
+#endif // COMPILE_ETHERNET
+
+        systemPrintln("f) Firmware Update");
+
+        systemPrintln("i) Configure Corrections Priorities");
+
+#ifdef COMPILE_ETHERNET
+        if (present.ethernet_ws5500 == true)
+            systemPrintln("n) Configure NTP");
+#endif // COMPILE_ETHERNET
+
+        systemPrintln("p) Configure PointPerfect");
+
+        systemPrintln("r) Configure Radios");
+
+        systemPrintln("s) Configure System");
+
+        systemPrintln("t) Configure Instrument Setup");
+
+        systemPrintln("u) Configure User Profiles");
+
+        if (btPrintEcho || tcpServerInRemoteConfig())
+            systemPrintln("b) Exit Remote Echo mode");
+
+        systemPrintln("+) Enter Command Line Mode");
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming == 1)
+            menuGNSS();
+        else if (incoming == 2)
+            gnss->menuMessages();
+        else if (incoming == 3)
+            menuBase();
+        else if (incoming == 4)
+            menuPorts();
+        else if (incoming == 5 && productVariant != RTK_TORCH) // Torch does not have logging
+            menuLogSelection();
+        else if (incoming == 6)
+            menuWiFi();
+        else if (incoming == 7)
+            menuTcpUdp();
+        else if (incoming == 'e' && (present.ethernet_ws5500 == true))
+            menuEthernet();
+        else if (incoming == 'f')
+            firmwareMenu();
+        else if (incoming == 'i')
+            menuCorrectionsPriorities();
+        else if (incoming == 'n' && (present.ethernet_ws5500 == true))
+            menuNTP();
+        else if (incoming == 'u')
+            menuUserProfiles();
+        else if (incoming == 'p')
+            menuPointPerfect();
+        else if (incoming == 'r')
+            menuRadio();
+        else if (incoming == 's')
+            menuSystem();
+        else if (incoming == 't')
+            menuInstrument();
+        else if ((incoming == 'b') && (btPrintEcho == true || tcpServerInRemoteConfig() == true))
+        {
+            printEndpoint = PRINT_ENDPOINT_SERIAL;
+            readEndpoint = PRINT_ENDPOINT_SERIAL;
+            systemPrintln("Remote device has exited echo mode");
+            btPrintEcho = false;
+            tcpServerDisableEndpoint();
+            break; // Exit config menu
+        }
+        else if (incoming == '+')
+            menuCommands();
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    if (settings.debugGnss == true)
+    {
+        // Re-enable GNSS debug once we exit config menus
+        gnss->debuggingEnable();
+    }
+
+    recordSystemSettings(); // Once all menus have exited, record the new settings to LittleFS and config file
+
+    clearBuffer();         // Empty buffer of any newline chars
+    forceMenuExit = false; // We are out of the menu system
+    inMainMenu = false;
+
+    // Change the USB serial output behavior if necessary
+    //
+    // The mosaic-X5 has separate USB COM ports. NMEA and RTCM will be output on USB1 if
+    // settings.enableGnssToUsbSerial is true. forwardGnssDataToUsbSerial is never set true.
+    if (!present.gnss_mosaicX5)
+        forwardGnssDataToUsbSerial = settings.enableGnssToUsbSerial;
+
+    // While in LoRa mode, we need to know when the last serial interaction was
+    loraLastIncomingSerial = millis();
+}
+
+#ifdef COMPILE_MENU_USER_PROFILES
+
+// Change system wide settings based on current user profile
+// Ways to change the GNSS settings:
+// Menus - we apply changes at the exit of each sub menu
+// Settings file - we detect differences between NVM and settings txt file
+// Profile -
+// AP -
+// Setup button -
+// Factory reset -
+void menuUserProfiles()
+{
+    uint8_t originalProfileNumber = profileNumber;
+
+    bool forceReset =
+        false; // If we reset a profile to default, the profile number has not changed, but we still need to reset
+
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: User Profiles");
+
+        // List available profiles
+        for (int x = 0; x < MAX_PROFILE_COUNT; x++)
+        {
+            if (activeProfiles & (1 << x))
+                systemPrintf("%d) Select %s", x + 1, profileNames[x]);
+            else
+                systemPrintf("%d) Select (Empty)", x + 1);
+
+            if (x == profileNumber)
+                systemPrint(" <- Current");
+
+            systemPrintln();
+        }
+
+        systemPrintf("c) Copy current profile to next empty slot\r\n");
+
+        systemPrintf("d) Delete profile '%s'\r\n", profileNames[profileNumber]);
+
+        systemPrintf("n) Edit profile name: %s\r\n", profileNames[profileNumber]);
+
+        systemPrintf("p) Print profile\r\n");
+
+        systemPrintf("r) Set profile '%s' to factory defaults\r\n", profileNames[profileNumber]);
+
+        systemPrintf("x) Exit\r\n");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        if (incoming >= 1 && incoming <= MAX_PROFILE_COUNT)
+        {
+            changeProfileNumber(incoming - 1); // Align inputs to array
+        }
+        else if (incoming == 'n')
+        {
+            systemPrint("Enter new profile name: ");
+            getUserInputString(settings.profileName, sizeof(settings.profileName));
+            recordSystemSettings(); // We need to update this immediately in case user lists the available profiles
+                                    // again
+            setProfileName(profileNumber);
+        }
+        else if (incoming == 'r')
+        {
+            systemPrintf("\r\nReset profile '%s' to factory defaults. Press 'y' to confirm:",
+                         profileNames[profileNumber]);
+            byte bContinue = getUserInputCharacterNumber();
+            if (bContinue == 'y')
+            {
+                settingsToDefaults(); // Overwrite our current settings with defaults
+
+                recordSystemSettings(); // Overwrite profile file and NVM with these settings
+
+                // Get bitmask of active profiles
+                activeProfiles = loadProfileNames();
+
+                forceReset = true; // Upon exit of menu, reset the device
+            }
+            else
+                systemPrintln("Reset aborted");
+        }
+        else if (incoming == 'd')
+        {
+            systemPrintf("\r\nDelete profile '%s'. Press 'y' to confirm:", profileNames[profileNumber]);
+            byte bContinue = getUserInputCharacterNumber();
+            if (bContinue == 'y')
+            {
+                deleteProfileFiles(profileNumber, false); // We do not have the semaphore yet
+
+                // We need to load these settings from file so that we can
+                // record a profile name change correctly
+                changeProfileNumber(0, false);
+
+                // Get bitmask of active profiles
+                activeProfiles = loadProfileNames();
+            }
+            else
+                systemPrintln("Delete aborted");
+        }
+        else if (incoming == 'p')
+        {
+            // Print profile
+            systemPrintf("Select the profile to be printed (1-%d): ", MAX_PROFILE_COUNT);
+
+            int printThis = getUserInputNumber(); // Returns EXIT, TIMEOUT, or long
+
+            if (printThis >= 1 && printThis <= MAX_PROFILE_COUNT)
+            {
+                char printFileName[60];
+                snprintf(printFileName, sizeof(printFileName), "/%s_Settings_%d.txt", platformFilePrefix,
+                         printThis - 1);
+                printSystemSettingsFromFileLFS(printFileName);
+            }
+        }
+        else if (incoming == 'c')
+        {
+            int8_t destinationProfile = -1;
+            for (int offset = 1; offset < MAX_PROFILE_COUNT; offset++)
+            {
+                int8_t testProfile = (profileNumber + offset) % MAX_PROFILE_COUNT;
+                if ((activeProfiles & (1 << testProfile)) == 0)
+                {
+                    destinationProfile = testProfile;
+                    break;
+                }
+            }
+
+            if (destinationProfile < 0)
+            {
+                systemPrintln("No empty profile slots available");
+            }
+            else
+            {
+                // Settings is a large struct (message rate tables, NTRIP/WiFi arrays, etc).
+                // Pull it from PSRAM (falls back to RAM) rather than loopTask's stack.
+                struct Settings *sourceSettings =
+                    (struct Settings *)rtkMalloc(sizeof(*sourceSettings), "menuUserProfiles sourceSettings");
+                if (sourceSettings == nullptr)
+                {
+                    systemPrintln("ERROR: Failed to allocate sourceSettings, copy aborted");
+                    reportHeapNow(true);
+                    continue;
+                }
+
+                char sourceProfileName[sizeof(settings.profileName)];
+                char copiedProfileBase[sizeof(settings.profileName)];
+                char copiedProfileName[sizeof(settings.profileName)];
+                uint8_t sourceProfileNumber = profileNumber;
+
+                memcpy(sourceSettings, &settings, sizeof(*sourceSettings));
+                strncpy(sourceProfileName, profileNames[sourceProfileNumber], sizeof(sourceProfileName));
+                sourceProfileName[sizeof(sourceProfileName) - 1] = '\0';
+
+                strncpy(copiedProfileBase, sourceProfileName, sizeof(copiedProfileBase));
+                copiedProfileBase[sizeof(copiedProfileBase) - 1] = '\0';
+
+                int copyNumber = 1;
+                char *suffix = strstr(copiedProfileBase, "-Copy");
+                if (suffix != nullptr)
+                {
+                    bool validSuffix = true;
+                    int parsedNumber = 0;
+                    char *numberStart = suffix + 5;
+
+                    if (*numberStart == '\0')
+                    {
+                        copyNumber = 2;
+                    }
+                    else
+                    {
+                        for (char *ptr = numberStart; *ptr != '\0'; ptr++)
+                        {
+                            if (*ptr < '0' || *ptr > '9')
+                            {
+                                validSuffix = false;
+                                break;
+                            }
+                            parsedNumber *= 10;
+                            parsedNumber += *ptr - '0';
+                        }
+
+                        if (validSuffix)
+                            copyNumber = parsedNumber + 1;
+                    }
+
+                    if (validSuffix)
+                        *suffix = '\0';
+                }
+
+                bool copyNameInUse = false;
+                do
+                {
+                    if (copyNumber == 1)
+                        snprintf(copiedProfileName, sizeof(copiedProfileName), "%s-Copy", copiedProfileBase);
+                    else
+                        snprintf(copiedProfileName, sizeof(copiedProfileName), "%s-Copy%d", copiedProfileBase,
+                                 copyNumber);
+
+                    copyNameInUse = false;
+                    for (int x = 0; x < MAX_PROFILE_COUNT; x++)
+                    {
+                        if ((activeProfiles & (1 << x)) && (strcmp(profileNames[x], copiedProfileName) == 0))
+                        {
+                            copyNameInUse = true;
+                            break;
+                        }
+                    }
+                    copyNumber++;
+                } while (copyNameInUse && (copyNumber < 100));
+
+                changeProfileNumber(destinationProfile); // Saves source first, then switches to destination
+
+                memcpy(&settings, sourceSettings, sizeof(settings));
+                strncpy(settings.profileName, copiedProfileName, sizeof(settings.profileName));
+                settings.profileName[sizeof(settings.profileName) - 1] = '\0';
+
+                recordSystemSettings();
+                setProfileName(profileNumber);
+
+                changeProfileNumber(sourceProfileNumber, false);
+
+                activeProfiles = loadProfileNames();
+
+                systemPrintf("Copied profile '%s' to slot %d as '%s'\r\n", sourceProfileName,
+                             destinationProfile + 1, copiedProfileName);
+
+                rtkFree(sourceSettings, "menuUserProfiles sourceSettings");
+            }
+        }
+
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_EMPTY)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETCHARACTERNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    if (originalProfileNumber != profileNumber || forceReset == true)
+    {
+        systemPrintln("Rebooting to apply new profile settings. Goodbye!");
+        delay(2000);
+        ESP.restart();
+    }
+
+    // A user may edit the name of a profile, but then switch back to original profile.
+    // Thus, no reset, and activeProfiles is not updated. Do it here.
+    // Get bitmask of active profiles
+    activeProfiles = loadProfileNames();
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#endif // COMPILE_MENU_USER_PROFILES
+
+#ifdef COMPILE_MENU_RADIO
+
+// Configure the internal radio, if available
+void menuRadio()
+{
+    BluetoothRadioType_e bluetoothUserChoice = settings.bluetoothRadioType;
+    bool clearBtPairings = settings.clearBtPairings;
+
+    while (1)
+    {
+        systemPrintln();
+        systemPrintln("Menu: Radios");
+
+        if (present.radio_lora == true)
+        {
+            if (strlen(loraFirmwareVersionStr) == 0)
+                systemPrintln("LoRa firmware: Unknown");
+            else
+                systemPrintf("LoRa firmware: %s\r\n", loraFirmwareVersionStr);
+        }
+
+#ifndef COMPILE_ESPNOW
+        systemPrintln("1) **ESP-NOW Not Compiled**");
+#else // COMPILE_ESPNOW
+        if (settings.enableEspNow == false)
+            systemPrintln("1) ESP-NOW Radio: Disabled");
+
+        else // ESP-NOW enabled
+        {
+            systemPrint("1) ESP-NOW Radio: Enabled - MAC ");
+            for (int x = 0; x < 5; x++)
+                systemPrintf("%02X:", wifiMACAddress[x]);
+            systemPrintf("%02X\r\n", wifiMACAddress[5]);
+
+            if (settings.espnowPeerCount > 0)
+            {
+                systemPrintln("  Paired Radios: ");
+                for (int x = 0; x < settings.espnowPeerCount; x++)
+                {
+                    systemPrint("    ");
+                    for (int y = 0; y < 5; y++)
+                        systemPrintf("%02X:", settings.espnowPeers[x][y]);
+                    systemPrintf("%02X\r\n", settings.espnowPeers[x][5]);
+                }
+            }
+            else
+                systemPrintln("  No Paired Radios - Broadcast Enabled");
+
+            if (espNowState == ESPNOW_BROADCASTING || espNowState == ESPNOW_PAIRED)
+                systemPrintf("2) Pairing: %s\r\n", espnowRequestPair ? "Requested" : "Not requested");
+            else if (espNowState == ESPNOW_PAIRING)
+            {
+                if (espnowRequestPair == true)
+                    systemPrintln("2) (Pairing in process) Stop pairing");
+                else
+                    systemPrintln("2) Pairing stopped");
+            }
+
+            systemPrintln("3) Forget all radios");
+
+            if (settings.debugEspNow == true)
+            {
+                systemPrintln("5) Add dummy radio");
+                systemPrintln("6) Send dummy data");
+                systemPrintln("7) Broadcast dummy data");
+            }
+        }
+
+#endif // COMPILE_ESPNOW
+
+        if (present.radio_lora == true)
+        {
+            if (settings.enableLora == false)
+            {
+                systemPrintln("10) LoRa Radio: Disabled");
+            }
+            else
+            {
+                systemPrintln("10) LoRa Radio: Enabled");
+                systemPrintf("11) LoRa Coordination Frequency: %0.3f\r\n", settings.loraCoordinationFrequency);
+                systemPrintf("12) LoRa Transmit Gain: %ddB\r\n", settings.loraTransmitGain_dB);
+                systemPrintf("13) LoRa Save Settings to Flash: %s\r\n",
+                             settings.loraSaveSettingsToFlash ? "Enabled" : "Disabled");
+                if (present.loraDedicatedUart == false)
+                    systemPrintf("14) Seconds without user serial that must elapse before LoRa radio goes "
+                                 "into dedicated listening mode: %d\r\n",
+                                 settings.loraSerialInteractionTimeout_s);
+            }
+        }
+
+        systemPrintf("20) Set default WiFi channel: %d\r\n", wifiChannel);
+
+        // Display Bluetooth menu
+        mmDisplayBluetoothRadioMenu('b', bluetoothUserChoice);
+
+        // If in BLUETOOTH_RADIO_SPP_AND_BLE, allow user to delete all pairings and set EA Protocol name
+        if (bluetoothUserChoice == BLUETOOTH_RADIO_SPP_AND_BLE)
+        {
+            systemPrintf("a) Accessory time offset: %.3fs\r\n", settings.accessoryTimeOffset_s);
+            systemPrintf("c) Clear BT pairings: %s\r\n", clearBtPairings ? "Yes" : "No");
+        }
+
+        systemPrintln("x) Exit");
+
+        byte incoming = getUserInputCharacterNumber();
+
+        // Select the bluetooth radio
+        if (incoming == 'b')
+            bluetoothUserChoice = mmChangeBluetoothProtocol(bluetoothUserChoice);
+
+        // Allow user to adjust the accessory mode time offset
+        else if ((incoming == 'a') && (bluetoothUserChoice == BLUETOOTH_RADIO_SPP_AND_BLE))
+        {
+            systemPrint("Enter new Accessory time offset: ");
+            double tOffset;
+            if (getUserInputDouble(&tOffset) == INPUT_RESPONSE_VALID)
+                settings.accessoryTimeOffset_s = tOffset;
+        }
+
+        // Allow user to clear BT pairings - when BTClassicSerial is next begun
+        else if ((incoming == 'c') && (bluetoothUserChoice == BLUETOOTH_RADIO_SPP_AND_BLE))
+            clearBtPairings ^= 1;
+
+        else if (incoming == 1)
+        {
+            settings.enableEspNow ^= 1;
+
+            // Start ESP-NOW so that getChannel runs correctly
+            if (settings.enableEspNow == true)
+                wifiEspNowOn(__FILE__, __LINE__); // Handles espNowStart
+            else
+                wifiEspNowOff(__FILE__, __LINE__); // Handles espNowStop
+        }
+        else if (settings.enableEspNow == true && incoming == 2)
+        {
+            if (espNowIsBroadcasting() == true || espNowIsPaired() == true)
+            {
+                espnowRequestPair ^= 1;
+            }
+            else if (espNowIsPairing() == true)
+            {
+                espnowRequestPair = false;
+                systemPrintln("Pairing stop requested");
+            }
+        }
+        else if (settings.enableEspNow == true && incoming == 3)
+        {
+            systemPrintln("\r\nForgetting all paired radios. Press 'y' to confirm:");
+            byte bContinue = getUserInputCharacterNumber();
+            if (bContinue == 'y')
+            {
+                if (wifiEspNowRunning)
+                {
+                    for (int x = 0; x < settings.espnowPeerCount; x++)
+                        espNowRemovePeer(settings.espnowPeers[x]);
+
+                    espNowStart(); // Restart ESP-NOW to enable broadcastMAC
+                }
+                settings.espnowPeerCount = 0;
+                systemPrintln("Radios forgotten");
+            }
+        }
+        else if (settings.enableEspNow == true && incoming == 5 && settings.debugEspNow == true)
+        {
+            if (wifiEspNowRunning == false)
+                wifiEspNowOn(__FILE__, __LINE__);
+
+            uint8_t peer1[] = {0xB8, 0xD6, 0x1A, 0x0D, 0x8F, 0x9C}; // Random MAC
+#ifdef COMPILE_ESPNOW
+            if (esp_now_is_peer_exist(peer1) == true)
+                log_d("Peer already exists");
+            else
+            {
+                // Add new peer to system
+                espNowAddPeer(peer1);
+
+                // Record this MAC to peer list
+                memcpy(settings.espnowPeers[settings.espnowPeerCount], peer1, 6);
+                settings.espnowPeerCount++;
+                settings.espnowPeerCount %= ESPNOW_MAX_PEERS;
+                recordSystemSettings();
+            }
+
+            espNowSetState(ESPNOW_PAIRED);
+#endif
+        }
+        else if (settings.enableEspNow == true && incoming == 6 && settings.debugEspNow == true)
+        {
+            if (wifiEspNowRunning == false)
+                wifiEspNowOn(__FILE__, __LINE__);
+
+            const uint8_t espNowData[] =
+                "This is the long string to test how quickly we can send one string to the other unit. I am going to "
+                "need a much longer sentence if I want to get a long amount of data into one transmission. This is "
+                "nearing 200 characters but needs to be near 250.";
+#ifdef COMPILE_ESPNOW
+            esp_now_send(0, (uint8_t *)&espNowData, sizeof(espNowData)); // Send packet to all peers
+#endif
+        }
+        else if (settings.enableEspNow == true && incoming == 7 && settings.debugEspNow == true)
+        {
+            if (wifiEspNowRunning == false)
+                wifiEspNowOn(__FILE__, __LINE__);
+
+            const uint8_t espNowData[] =
+                "This is the long string to test how quickly we can send one string to the other unit. I am going to "
+                "need a much longer sentence if I want to get a long amount of data into one transmission. This is "
+                "nearing 200 characters but needs to be near 250.";
+#ifdef COMPILE_ESPNOW
+            esp_now_send(espNowBroadcastAddr, (uint8_t *)&espNowData, sizeof(espNowData)); // Send packet over broadcast
+#endif
+        }
+
+        else if (present.radio_lora == true && incoming == 10)
+        {
+            settings.enableLora ^= 1;
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_NMEA); // We may need to enable / disable NMEA
+            gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_OTHER); // Make sure PQTMRTCMIS is enabled on LG290P
+            gnssConfigure(GNSS_CONFIG_EXT_CORRECTIONS);   // We may need to enable RTCM input
+            // Setting the GNSS baud rate for LoRa is handled by the loraState machine
+
+        }
+        else if (present.radio_lora == true && settings.enableLora == true && incoming == 11)
+        {
+            getNewSetting("Enter the frequency used to coordinate radios in MHz", 903.0, 927.0,
+                          &settings.loraCoordinationFrequency);
+        }
+        else if (present.radio_lora == true && settings.enableLora == true && incoming == 12)
+        {
+            getNewSetting("Enter the transmit gain in dB", 0, 13, &settings.loraTransmitGain_dB);
+        }
+        else if (present.radio_lora == true && settings.enableLora == true && incoming == 13)
+            settings.loraSaveSettingsToFlash ^= 1;
+        else if (present.radio_lora == true && settings.enableLora == true && present.loraDedicatedUart == false &&
+                 incoming == 14)
+        {
+            getNewSetting("Enter the number of seconds without user serial that must elapse before LoRa radio goes "
+                          "into dedicated listening mode",
+                          10, 600, &settings.loraSerialInteractionTimeout_s);
+        }
+
+        // Set the default WiFi channel
+        else if (incoming == 20)
+        {
+            if (getNewSetting("Enter the default WiFi channel", 1, 14, &settings.wifiChannel) == INPUT_RESPONSE_VALID)
+            {
+                if (settings.wifiChannel == wifiChannel)
+                    systemPrintf("WiFi is already on channel %d.", settings.wifiChannel);
+                else
+                {
+                    if (wifiSoftApRunning || wifiStationRunning)
+                        systemPrintf("Restart WiFi to use channel %d.", settings.wifiChannel);
+                    else if (wifiEspNowRunning)
+                        systemPrintf("Restart ESP-NOW to use channel %d.", settings.wifiChannel);
+                    else
+                        systemPrintf("Please start ESP-NOW to use channel %d.", settings.wifiChannel);
+                }
+            }
+        }
+
+        else if (incoming == 'x')
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_EXIT)
+            break;
+        else if (incoming == INPUT_RESPONSE_GETNUMBER_TIMEOUT)
+            break;
+        else
+            printUnknown(incoming);
+    }
+
+    wifiEspNowOn(__FILE__, __LINE__); // Turn on the hardware if settings.enableEspNow is true
+
+    // Update Bluetooth radio if settings have changed
+    bluetoothApplySettings(bluetoothUserChoice, clearBtPairings);
+
+    // LoRa radio state machine will start/stop radio upon next updateLora in loop()
+
+    clearBuffer(); // Empty buffer of any newline chars
+}
+
+#endif // COMPILE_MENU_RADIO
+#endif // COMPILE_SERIAL_MENUS

@@ -1,0 +1,3073 @@
+/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+Tasks.ino
+
+  This module implements the high-frequency tasks made by xTaskCreate() and any
+  low-frequency tasks that are called by Ticker.
+
+                                   GNSS
+                                    |
+                                    v
+                           .--------+--------.
+                           |                 |
+                           v                 v
+                          UART      or      I2C
+                           |                 |
+                           |                 |
+                           '------->+<-------'
+                                    |
+                                    | gnssReadTask
+                                    |    waitForPreamble
+                                    |        ...
+                                    |    processUart1Message
+                                    |
+                                    v
+                               Ring Buffer
+                                    |
+                                    | handleGnssDataTask
+                                    |
+                                    v
+            .---------------+-------+--------+---------------+
+            |               |                |               |
+            |               |                |               |
+            v               v                v               v
+        Bluetooth      TCP Client     TCP/UDP Server      SD Card
+
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+
+//----------------------------------------
+// Macros
+//----------------------------------------
+
+#define WRAP_OFFSET(offset, increment, arraySize)                                                                      \
+    {                                                                                                                  \
+        offset += increment;                                                                                           \
+        if (offset >= arraySize)                                                                                       \
+            offset -= arraySize;                                                                                       \
+    }
+
+//----------------------------------------
+// Constants
+//----------------------------------------
+
+enum RingBufferConsumers
+{
+    RBC_BLUETOOTH = 0,
+    RBC_TCP_CLIENT,
+    RBC_TCP_SERVER,
+    RBC_SD_CARD,
+    RBC_UDP_SERVER,
+    RBC_USB_SERIAL,
+    // Insert new consumers here
+    RBC_MAX
+};
+
+const char *const ringBufferConsumer[] = {
+    "Bluetooth", "TCP Client", "TCP Server", "SD Card", "UDP Server", "USB Serial",
+};
+
+const int ringBufferConsumerEntries = sizeof(ringBufferConsumer) / sizeof(ringBufferConsumer[0]);
+
+// Define the index values into the parserTable
+#define RTK_NMEA_PARSER_INDEX 0
+#define RTK_UNICORE_HASH_PARSER_INDEX 1
+#define RTK_RTCM_PARSER_INDEX 2
+#define RTK_UBLOX_PARSER_INDEX 3
+#define RTK_UNICORE_BINARY_PARSER_INDEX 4
+
+// List the parsers to be included
+const SEMP_PARSER_DESCRIPTION *parserTable[] = {
+    &sempNmeaParserDescription,          // 0
+    &sempUnicoreHashParserDescription,   // 1
+    &sempRtcmParserDescription,          // 2
+    &sempUbloxParserDescription,         // 3
+    &sempUnicoreBinaryParserDescription, // 4
+};
+const int parserCount = sizeof(parserTable) / sizeof(parserTable[0]);
+
+// We need a separate parsers for the mosaic-X5: to allow SBF to be separated from L-Band SPARTN;
+// and to allow encapsulated NMEA and RTCMv3 to be parsed without upsetting the SPARTN parser.
+const SEMP_PARSER_DESCRIPTION *sbfParserTable[] = {&sempSbfParserDescription};
+const int sbfParserCount = sizeof(sbfParserTable) / sizeof(sbfParserTable[0]);
+
+const SEMP_PARSER_DESCRIPTION *spartnParserTable[] = {&sempSpartnParserDescription};
+const int spartnParserCount = sizeof(spartnParserTable) / sizeof(spartnParserTable[0]);
+
+const SEMP_PARSER_DESCRIPTION *rtcmParserTable[] = {&sempRtcmParserDescription};
+const int rtcmParserCount = sizeof(rtcmParserTable) / sizeof(rtcmParserTable[0]);
+
+//----------------------------------------
+// Locals
+//----------------------------------------
+
+volatile static RING_BUFFER_OFFSET dataHead; // Head advances as data comes in from GNSS's UART
+volatile int32_t availableHandlerSpace;      // settings.gnssHandlerBufferSize - usedSpace
+volatile const char *slowConsumer;
+
+// Buffer the incoming Bluetooth stream so that it can be passed in bulk over I2C
+uint8_t bluetoothOutgoingToGnss[100];
+uint16_t bluetoothOutgoingToGnssHead;
+unsigned long lastGnssSend; // Timestamp of the last time we sent RTCM to GNSS
+
+// Ring buffer tails
+static RING_BUFFER_OFFSET btRingBufferTail;  // BT Tail advances as it is sent over BT
+static RING_BUFFER_OFFSET sdRingBufferTail;  // SD Tail advances as it is recorded to SD
+static RING_BUFFER_OFFSET usbRingBufferTail; // USB Tail advances as it is sent over USB serial
+
+// Ring buffer offsets
+static uint16_t rbOffsetHead;
+
+//----------------------------------------
+// Task routines
+//----------------------------------------
+
+// If the phone has any new data (NTRIP RTCM, etc), read it in over Bluetooth and pass it along to GNSS
+// Scan for escape characters to enter the config menu
+void btReadTask(void *e)
+{
+    int rxBytes;
+
+    unsigned long btLastByteReceived = 0; // Track when the last BT transmission was received.
+    const long btMinEscapeTime =
+        2000; // Bluetooth serial traffic must stop this amount before an escape char is recognized
+    uint8_t btEscapeCharsReceived = 0; // Used to enter remote command mode
+
+    // Start notification
+    task.btReadTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintln("Task btReadTask started");
+
+    // Run task until a request is raised
+    task.btReadTaskStopRequest = false;
+    while (task.btReadTaskStopRequest == false)
+    {
+        // Display an alive message
+        if (PERIODIC_DISPLAY(PD_TASK_BLUETOOTH_READ) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_TASK_BLUETOOTH_READ);
+            systemPrintln("btReadTask running");
+        }
+
+        // Receive RTCM corrections or UBX config messages over bluetooth and pass them along to GNSS
+        rxBytes = 0;
+        if (bluetoothGetState() == BT_CONNECTED)
+        {
+            while (btPrintEcho == false && (bluetoothRxDataAvailable() > 0))
+            {
+                // Check stream for command characters
+                byte incoming = bluetoothRead();
+                rxBytes += 1;
+
+                if (incoming == btEscapeCharacter)
+                {
+                    // Ignore escape characters received within 2 seconds of serial traffic
+                    // Allow escape characters received within the first 2 seconds of power on
+                    if (((millis() - btLastByteReceived) > btMinEscapeTime) || (millis() < btMinEscapeTime))
+                    {
+                        btEscapeCharsReceived++;
+                        if (btEscapeCharsReceived == btMaxEscapeCharacters)
+                        {
+                            printEndpoint = PRINT_ENDPOINT_ALL;
+                            readEndpoint = PRINT_ENDPOINT_BLUETOOTH;
+                            systemPrintln("Echoing all serial to BT device");
+                            btPrintEcho = true;
+
+                            btEscapeCharsReceived = 0;
+                            btLastByteReceived = millis();
+                        }
+                    }
+                    else
+                    {
+                        // Ignore this escape character, pass it along to the output
+                        addToGnssBuffer(btEscapeCharacter);
+                    }
+                }
+
+                else // This character is not a command character, pass along to GNSS
+                {
+                    // Pass any escape characters that turned out to not be a complete escape sequence
+                    while (btEscapeCharsReceived-- > 0)
+                    {
+                        addToGnssBuffer(btEscapeCharacter);
+                    }
+
+                    // Pass byte to GNSS receiver or to system
+                    // TODO - control if this RTCM source should be listened to or not
+
+                    // UART RX can be corrupted by UART TX
+                    // See issue: https://github.com/sparkfun/SparkFun_RTK_Firmware/issues/469
+                    // serialGNSS->write(incoming);
+                    addToGnssBuffer(incoming);
+
+                    btLastByteReceived = millis();
+                    btEscapeCharsReceived = 0; // Update timeout check for escape char and partial frame
+
+                    bluetoothIncomingRTCM = true;
+
+                    // Record the arrival of RTCM from the Bluetooth connection (a phone or tablet is providing the RTCM
+                    // via NTRIP). This resets the RTCM timeout used on the L-Band.
+                    rtcmLastPacketReceived = millis();
+
+                } // End just a character in the stream
+
+            } // End btPrintEcho == false && bluetoothRxDataAvailable()
+
+            if (PERIODIC_DISPLAY(PD_BLUETOOTH_DATA_RX) && !inMainMenu)
+            {
+                PERIODIC_CLEAR(PD_BLUETOOTH_DATA_RX);
+                systemPrintf("Bluetooth received %d bytes\r\n", rxBytes);
+            }
+        } // End bluetoothGetState() == BT_CONNECTED
+
+        if (bluetoothOutgoingToGnssHead > 0 && ((millis() - lastGnssSend) > 100))
+        {
+            sendGnssBuffer(); // Send any outstanding RTCM
+        }
+
+        if ((settings.enableTaskReports == true) && (!inMainMenu))
+            systemPrintf("SerialWriteTask High watermark: %d\r\n", uxTaskGetStackHighWaterMark(nullptr));
+
+        feedWdt();
+        taskYIELD();
+    } // End while(true)
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintln("Task btReadTask stopped");
+    task.btReadTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+// Add byte to buffer that will be sent to GNSS
+// We cannot write single characters to the ZED over I2C (as this will change the address pointer)
+void addToGnssBuffer(uint8_t incoming)
+{
+    bluetoothOutgoingToGnss[bluetoothOutgoingToGnssHead] = incoming;
+
+    bluetoothOutgoingToGnssHead++;
+    if (bluetoothOutgoingToGnssHead == sizeof(bluetoothOutgoingToGnss))
+    {
+        sendGnssBuffer();
+    }
+}
+
+// Push the buffered data in bulk to the GNSS
+void sendGnssBuffer()
+{
+    if (correctionLastSeen(CORR_BLUETOOTH))
+    {
+        sempParseNextBytes(rtcmParse, bluetoothOutgoingToGnss,
+                           bluetoothOutgoingToGnssHead); // Parse the data for RTCM1005/1006
+        if (gnss->pushRawData(bluetoothOutgoingToGnss, bluetoothOutgoingToGnssHead))
+        {
+            if ((settings.debugCorrections || PERIODIC_DISPLAY(PD_GNSS_DATA_TX)) && !inMainMenu)
+            {
+                PERIODIC_CLEAR(PD_GNSS_DATA_TX);
+                systemPrintf("Sent %d BT bytes to GNSS\r\n", bluetoothOutgoingToGnssHead);
+            }
+        }
+    }
+    else
+    {
+        if ((settings.debugCorrections || PERIODIC_DISPLAY(PD_GNSS_DATA_TX)) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_GNSS_DATA_TX);
+            systemPrintf("%d BT bytes NOT sent due to priority\r\n", bluetoothOutgoingToGnssHead);
+        }
+    }
+
+    // No matter the response, wrap the head and reset the timer
+    bluetoothOutgoingToGnssHead = 0;
+    lastGnssSend = millis();
+}
+
+// Normally a delay(1) will feed the WDT but if we don't want to wait that long, this feeds the WDT without delay
+void feedWdt()
+{
+    vTaskDelay(1);
+}
+
+//----------------------------------------------------------------------
+// The ESP32<->GNSS serial connection is default 230,400bps to facilitate
+// 10Hz fix rate with PPP Logging Defaults (NMEAx5 + RXMx2) messages enabled.
+// ESP32's UART used for GNSS  is begun with settings.uartReceiveBufferSize size buffer. The circular buffer
+// is 1024*6. At approximately 46.1K characters/second, a 6144 * 2
+// byte buffer should hold 267ms worth of serial data. Assuming SD writes are
+// 250ms worst case, we should record incoming all data. Bluetooth congestion
+// or conflicts with the SD card semaphore should clear within this time.
+//
+// Ring buffer empty when all the tails == dataHead
+//
+//        +---------+
+//        |         |
+//        |         |
+//        |         |
+//        |         |
+//        +---------+ <-- dataHead, btRingBufferTail, sdRingBufferTail, etc.
+//
+// Ring buffer contains data when any tail != dataHead
+//
+//        +---------+
+//        |         |
+//        |         |
+//        | yyyyyyy | <-- dataHead
+//        | xxxxxxx | <-- btRingBufferTail (1 byte in buffer)
+//        +---------+ <-- sdRingBufferTail (2 bytes in buffer)
+//
+//        +---------+
+//        | yyyyyyy | <-- btRingBufferTail (1 byte in buffer)
+//        | xxxxxxx | <-- sdRingBufferTail (2 bytes in buffer)
+//        |         |
+//        |         |
+//        +---------+ <-- dataHead
+//
+// Maximum ring buffer fill is settings.gnssHandlerBufferSize - 1
+//----------------------------------------------------------------------
+
+// Read bytes from GNSS into ESP32 circular buffer
+// If data is coming in at 230,400bps = 23,040 bytes/s = one byte every 0.043ms
+// If SD blocks for 150ms (not extraordinary) that is 3,488 bytes that must be buffered
+// The ESP32 Arduino FIFO is ~120 bytes by default but overridden to 50 bytes (see pinGnssUartTask() and
+// uart_set_rx_full_threshold()). We use this task to harvest from FIFO into circular buffer during SD write blocking
+// time.
+void gnssReadTask(void *e)
+{
+    size_t bufferLength;
+    uint8_t *rtkBuffer;
+    uint8_t *sbfBuffer;
+    uint8_t *spartnBuffer;
+
+    rtkBuffer = nullptr;
+    sbfBuffer = nullptr;
+    spartnBuffer = nullptr;
+
+    // Start notification
+    task.gnssReadTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintln("Task gnssReadTask started");
+
+    // Initialize the main parser
+    bufferLength = sempGetBufferLength(parserTable, parserCount, psramFound() ? 16384 : 3000);
+    rtkBuffer = (uint8_t *)rtkMalloc(bufferLength, "SEMP rtkBuffer");
+    rtkParse = sempBeginParser("rtkParse", parserTable, parserCount, rtkBuffer, bufferLength,
+                               processUart1Message, // eom Call Back
+                               output);             // Routine to output an error character
+    if (!rtkParse)
+        reportFatalError("Failed to initialize the parser");
+
+    if (settings.debugGnss)
+    {
+        sempDebugOutputEnable(rtkParse, output); // Standard debug on Serial
+        // sempDebugOutputEnable(rtkParse, output, true); // Verbose debug
+    }
+
+    // Abort NMEA and Unicore Hash on non-printable character
+    // Help faster recovery from UART errors on EVK
+    sempNmeaAbortOnNonPrintable(rtkParse);
+    sempUnicoreHashAbortOnNonPrintable(rtkParse);
+
+    bool sbfParserNeeded = present.gnss_mosaicX5;
+    bool spartnParserNeeded = present.gnss_mosaicX5 && (productVariant != RTK_FACET_FP);
+
+    if (sbfParserNeeded)
+    {
+        // Initialize the SBF parser for the mosaic-X5
+        bufferLength = psramFound() ? 16384 : sempGnssReadBufferSize;
+        if (bufferLength < sempGnssReadBufferSize)
+            bufferLength = sempGnssReadBufferSize;
+        bufferLength = sempGetBufferLength(sbfParserTable, sbfParserCount, bufferLength);
+        sbfBuffer = (uint8_t *)rtkMalloc(bufferLength, "SEMP sbfBuffer");
+        sbfParse = sempBeginParser("SEMP sbfBuffer", sbfParserTable, sbfParserCount, sbfBuffer, bufferLength,
+                                   processUart1SBF, // eom Call Back - in mosaic.ino
+                                   output);         // Routine to output an error character
+        if (!sbfParse)
+            reportFatalError("Failed to initialize the SBF parser");
+
+        // Uncomment the next line to enable SBF parser debug
+        // But be careful - you get a lot of "SEMP: Sbf SBF, 0x0002 (2) bytes, invalid preamble2"
+        // if (settings.debugGnss) sempEnableDebugOutput(sbfParse);
+
+        if (spartnParserNeeded)
+        {
+            // Any data which is not SBF will be passed to the SPARTN parser via the invalid data callback
+            sempSetInvalidDataCallback(sbfParse, processNonSBFData);
+
+            // Initialize the SPARTN parser for the mosaic-X5
+            // SPARTN payload is 1024 bytes max
+            bufferLength = sempGetBufferLength(spartnParserTable, spartnParserCount, 1200);
+            spartnBuffer = (uint8_t *)rtkMalloc(bufferLength, "SEMP spartnBuffer");
+            spartnParse = sempBeginParser("SEMP spartnBuffer", spartnParserTable, spartnParserCount, spartnBuffer,
+                                          bufferLength, processUart1SPARTN, // eom Call Back - in mosaic.ino
+                                          output);                          // Routine to output an error character
+            if (!spartnParse)
+                reportFatalError("Failed to initialize the SPARTN parser");
+
+            // Uncomment the next line to enable SPARTN parser debug
+            // But be careful - you get a lot of "SEMP: Spartn SPARTN 0 0, 0x00f4 (244) bytes, bad CRC"
+            // if (settings.debugGnss) sempEnableDebugOutput(spartnParse);
+        }
+    }
+
+    // Run task until a request is raised
+    task.gnssReadTaskStopRequest = false;
+    while (task.gnssReadTaskStopRequest == false)
+    {
+        // Display an alive message
+        if (PERIODIC_DISPLAY(PD_TASK_GNSS_READ) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_TASK_GNSS_READ);
+            systemPrintln("gnssReadTask running");
+        }
+
+        if ((settings.enableTaskReports == true) && (!inMainMenu))
+            systemPrintf("SerialReadTask High watermark: %d\r\n", uxTaskGetStackHighWaterMark(nullptr));
+
+        // Display the RX byte count
+        static uint32_t totalRxByteCount = 0;
+        if (PERIODIC_DISPLAY(PD_GNSS_DATA_RX_BYTE_COUNT) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_GNSS_DATA_RX_BYTE_COUNT);
+            systemPrintf("gnssReadTask total byte count: %d\r\n", totalRxByteCount);
+        }
+
+        // Two methods are accessing the hardware serial port (um980Config) at the
+        // same time: gnssReadTask() (to harvest incoming serial data) and um980 (the unicore library to configure the
+        // device) To allow the Unicore library to send/receive serial commands, we need to block the gnssReadTask
+        // If the Unicore library does not need lone access, then read from serial port
+
+        // For the Facet mosaic-X5, things are different. The mosaic-X5 outputs a raw stream of L-Band bytes,
+        // interspersed with periodic SBF blocks. The SBF blocks can contain encapsulated NMEA and RTCMv3.
+        // We need to pass each incoming byte to a SBF parser first, so it can pick out any SBF blocks.
+        // The SBF parser needs to 'give up' (return) any bytes which are not SBF. We do that using the
+        // invalidDataCallback. Any data that is not SBF is then parsed by a separate SPARTN parser.
+        // The SPARTN parser extracts SPARTN packets from the raw LBand data so they can be passed to the PPL.
+        // Encapsulated NMEA and RTCMv3 is extracted and passed to the the main SEMP parser.
+        // At some point in the future, Septentrio will (hopefully) add the ability to encapsulate the
+        // raw L-Band data in SBF format. This will make life SO much easier as the SEMP will then be able
+        // to parse everything and the separate SBF and SPARTN parsers won't be required.
+        //
+        // We need to be clever about this though. The raw L-Band data can manifest as SBF data. When that
+        // happens, it can cause sbfParse to 'stick' - parsing a long ghost SBF block. This prevents RTCM
+        // from being parsed from valid SBF blocks and causes the NTRIP server connection to break. We need
+        // to add extra checks, above and beyond the invalidDataCallback, to make sure that doesn't happen.
+        // Here we check that the SBF ID and length are expected / valid too.
+        //
+        // For Facet FP mosaic, we need the SBF parser but not the SPARTN parser
+
+        if (gnss->isBlocking() == false)
+        {
+            // Determine if serial data is available
+            while (serialGNSS->available())
+            {
+                // Read the data from UART1
+                static uint8_t incomingData[256];
+                int bytesIncoming = serialGNSS->read(incomingData, sizeof(incomingData));
+                totalRxByteCount += bytesIncoming;
+
+                if ((bytesIncoming < 0) || (bytesIncoming > sizeof(incomingData)))
+                {
+                    if (settings.debugGnss)
+                        systemPrintf("gnssReadTask: bytesIncoming = %d\r\n", bytesIncoming);
+                }
+
+                for (int x = 0; x < bytesIncoming; x++)
+                {
+                    // Update the parser state based on the incoming byte
+                    // On mosaic-X5, pass the byte to sbfParse. On all other platforms, pass it straight to rtkParse
+                    if (!sbfParserNeeded)
+                    {
+                        sempParseNextByte(rtkParse, incomingData[x]);
+                    }
+
+                    // See notes above. On the mosaic-X5, check that the incoming SBF blocks have expected IDs and
+                    // lengths to help prevent raw L-Band data being misidentified as SBF
+                    else // if (sbfParserNeeded)
+                    {
+                        sempParseNextByte(sbfParse, incomingData[x]);
+
+                        // Check if this is Length MSB
+                        // Also check parser is running - as invalidDataCallback may have just been called
+                        if ((sbfParse->state != sempFirstByte) && (sbfParse->type == 0) && (sbfParse->length == 8))
+                        {
+                            bool expected = false;
+                            for (int b = 0; b < MAX_MOSAIC_EXPECTED_SBF; b++) // For each expected SBF block
+                            {
+                                if (mosaicExpectedIDs[b].ID == sempSbfGetId(sbfParse)) // Check for ID match
+                                {
+                                    expected = true;
+                                    if (mosaicExpectedIDs[b].fixedLength)
+                                    {
+                                        // Check for length match if fixed
+                                        if (mosaicExpectedIDs[b].length != sempSbfGetLength(sbfParse))
+                                            expected = false;
+                                    }
+                                }
+                            }
+                            if (!expected) // SBF is not expected so restart the parsers
+                            {
+                                sbfParse->state = sempFirstByte;
+                                if (spartnParserNeeded)
+                                    spartnParse->state = sempFirstByte;
+                                if (settings.debugGnss)
+                                    systemPrintf("Unexpected SBF block %d - rejected on ID or length\r\n",
+                                                 sempSbfGetId(sbfParse));
+                                // We could pass the rejected bytes to the SPARTN parser but this is ~risky
+                                // as the L-Band data could overlap the start of actual SBF. I think it's
+                                // probably safer to discard the data and let both parsers re-sync?
+                                // for (uint32_t dataOffset = 0; dataOffset < 8; dataOffset++)
+                                // {
+                                //     // Update the SPARTN parser state based on the non-SBF byte
+                                //     sempParseNextByte(spartnParse, sbfParse->buffer[dataOffset]);
+                                // }
+                            }
+                        }
+
+                        // Extra checks for EncapsulatedOutput - length is variable but we can compare the length to the
+                        // payload length
+                        if ((sbfParse->type == 0) && (sbfParse->length == 18) && (sempSbfGetId(sbfParse) == 4097))
+                        {
+                            bool expected = true;
+                            if ((sbfParse->buffer[14] != 2) &&
+                                (sbfParse->buffer[14] != 4)) // Check Mode for RTCMv3 and NMEA
+                                expected = false;
+
+                            // SBF block length should be 20 more than N (payload length) - with padding
+                            if (expected)
+                            {
+                                uint16_t N = sbfParse->buffer[16];
+                                N |= ((uint16_t)sbfParse->buffer[17]) << 8;
+                                uint16_t expectedLength = N + 20; // Expected length
+                                uint16_t remainder = ((N + 20) % 4);
+                                if (remainder > 0)
+                                    expectedLength += 4 - remainder; // Include the padding
+                                if (sempSbfGetLength(sbfParse) != expectedLength)
+                                    expected = false;
+                            }
+
+                            if (!expected) // SBF is not expected so restart the parsers
+                            {
+                                sbfParse->state = sempFirstByte;
+                                if (spartnParserNeeded)
+                                    spartnParse->state = sempFirstByte;
+                                if (settings.debugGnss)
+                                    systemPrintf("Unexpected EncapsulatedOutput block - rejected\r\n");
+                                // We could pass the rejected bytes to the SPARTN parser but this is ~risky
+                                // as the L-Band data could overlap the start of actual SBF. I think it's
+                                // probably safer to discard the data and let both parsers re-sync?
+                                // for (uint32_t dataOffset = 0; dataOffset < 18; dataOffset++)
+                                // {
+                                //     // Update the SPARTN parser state based on the non-SBF byte
+                                //     sempParseNextByte(spartnParse, sbfParse->buffer[dataOffset]);
+                                // }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        feedWdt();
+        taskYIELD();
+    }
+
+    // Done parsing incoming data, free the parse buffer
+    if (rtkBuffer)
+        rtkFree(rtkBuffer, "SEMP rtkBuffer");
+    if (sbfBuffer)
+        rtkFree(sbfBuffer, "SEMP sbfBuffer");
+    if (spartnBuffer)
+        rtkFree(spartnBuffer, "SEMP spartnBuffer");
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintln("Task gnssReadTask stopped");
+    task.gnssReadTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+// Force the NMEA Talker ID - if needed
+// Note: this places a null directly after the csum, overwriting the \r (if there is one)
+void forceTalkerId(const char *Id, char *msg, size_t maxLen)
+{
+    if (msg[2] == *Id)
+        return; // Nothing to do
+
+    char oldTalker = msg[2];
+    msg[2] = *Id; // Force the Talker ID
+
+    // Update the checksum: XOR chars between '$' and '*'
+    size_t len = 1;
+    uint8_t csum = 0;
+    while ((len < maxLen) && (msg[len] != '*'))
+        csum = csum ^ msg[len++];
+
+    if (len >= (maxLen - 3))
+    {
+        // Something went horribly wrong. Restore the Talker ID
+        msg[2] = oldTalker;
+        return;
+    }
+
+    len++;                            // Point at the checksum and update it
+    sprintf(&msg[len], "%02X", csum); // null-terminate after csum
+}
+
+// Force the RMC COG entry - if needed
+// Note: this places a null directly after the csum, overwriting the \r (if there is one)
+void forceRmcCog(char *msg, size_t maxLen)
+{
+    const char *noCog = "0.0";
+
+    if (strstr(msg, "RMC") == nullptr)
+        return; // Nothing to do
+
+    if (maxLen < (strlen(msg) + strlen(noCog)))
+        return; // No room for the COG!
+
+    // Find the start of COG ("Track made good") - after the 8th comma
+    int numCommas = 0;
+    size_t len = 0;
+    while ((numCommas < 8) && (len < maxLen))
+    {
+        if (msg[len++] == ',')
+            numCommas++;
+    }
+
+    if (len >= maxLen) // Something went horribly wrong
+        return;
+
+    // If the next char is not a ',' - there's nothing to do
+    if (msg[len] != ',')
+        return;
+
+    // If the next char is a ',' - add "0.0" manually
+    // Start by creating space for the "0.0"
+    for (size_t i = strlen(msg); i > len; i--) // Work backwards from the NULL
+        msg[i + strlen(noCog)] = msg[i];
+
+    // Now insert the "0.0"
+    memcpy(&msg[len], noCog, strlen(noCog));
+
+    // Update the checksum: XOR chars between '$' and '*'
+    len = 1;
+    uint8_t csum = 0;
+    while ((len < maxLen) && (msg[len] != '*'))
+        csum = csum ^ msg[len++];
+    len++;                            // Point at the checksum and update it
+    sprintf(&msg[len], "%02X", csum); // null-terminate after csum
+}
+
+// Replace the RMC Mode Indicator - if needed
+// Location Information expects the Mode Indicator to be:
+// A=Autonomous, D=Differential, E=Approximation, N=Invalid Data
+// ATS throws an error with the F=Float, M=Manual, R=RTK from the LG290P
+// Change unsupported modes to A / D
+// Note: this places a null directly after the csum, overwriting the \r (if there is one)
+void replaceRmcModeIndicator(char *msg, size_t maxLen)
+{
+    if (strstr(msg, "RMC") == nullptr)
+        return; // Nothing to do
+
+    // Find the start of Mode Indicator - at the 12th comma
+    int numCommas = 0;
+    size_t len = 0;
+    while ((numCommas < 12) && (msg[len] != '*') && (len < maxLen))
+    {
+        if (msg[len++] == ',')
+            numCommas++;
+    }
+
+    if (len >= (maxLen - 3)) // Something went horribly wrong
+        return;
+
+    // If the next char is ',' or '*' - there's nothing to do
+    if ((msg[len] == ',') || (msg[len] == '*') || (numCommas < 12))
+        return;
+
+    // If the Mode Indicator is A, D, E or N - there's nothing to do
+    if ((msg[len] == 'A') || (msg[len] == 'D') || (msg[len] == 'E') || (msg[len] == 'N'))
+        return;
+
+    // Replace unsupported mode indicator
+    if (msg[len] == 'M') // Change Manual to Autonomous
+        msg[len] = 'A';
+    else
+        msg[len] = 'D'; // Change everything else to Differential
+
+    // Update the checksum: XOR chars between '$' and '*'
+    len = 1;
+    uint8_t csum = 0;
+    while ((len < maxLen) && (msg[len] != '*'))
+        csum = csum ^ msg[len++];
+    len++;                            // Point at the checksum and update it
+    sprintf(&msg[len], "%02X", csum); // null-terminate after csum
+}
+
+// Remove the RMC Navigational Status field - if needed
+// Note: this places a null directly after the csum, overwriting the \r (if there is one)
+void removeRmcNavStat(char *msg, size_t maxLen)
+{
+    if (strstr(msg, "RMC") == nullptr)
+        return; // Nothing to do
+
+    // Find the start of Nav Stat - at the 13th comma
+    int numCommas = 0;
+    size_t len = 0;
+    while ((numCommas < 13) && (msg[len] != '*') && (len < maxLen))
+    {
+        if (msg[len++] == ',')
+            numCommas++;
+    }
+
+    if (len >= (maxLen - 3)) // Something went horribly wrong
+        return;
+
+    // If the next char is '*' - there's nothing to do
+    if ((msg[len] == '*') || (numCommas < 13))
+        return;
+
+    // Find the asterix. (NavStatus should be a single char)
+    size_t asterix = len;
+    len--;
+
+    while ((msg[asterix] != '*') && (asterix < maxLen))
+        asterix++;
+
+    if (msg[asterix] != '*') // Something went horribly wrong
+        return;
+
+    // Delete the NavStat - overwrite it with the asterix
+    for (size_t i = 0; i < (strlen(msg) + 1 - asterix); i++) // Copy the * CSUM NULL
+        msg[len + i] = msg[asterix + i];
+
+    // Update the checksum: XOR chars between '$' and '*'
+    len = 1;
+    uint8_t csum = 0;
+    while ((len < maxLen) && (msg[len] != '*'))
+        csum = csum ^ msg[len++];
+    len++;                            // Point at the checksum and update it
+    sprintf(&msg[len], "%02X", csum); // null-terminate after csum
+}
+
+// Apply offsetSeconds to the UTC time in GGA / RMC / GST
+// Note: this places a null directly after the csum, overwriting the \r (if there is one)
+void utcAdjust(double offsetSeconds, char *msg, size_t maxLen)
+{
+    if (offsetSeconds == 0.0)
+        return; // Nothing to do
+
+    bool isRMC = (strstr(msg, "RMC") != nullptr);
+
+    // Find the start of UTC - at the 1st comma
+    int numCommas = 0;
+    size_t len = 0;
+    while ((numCommas < 1) && (msg[len] != '*') && (len < maxLen))
+    {
+        if (msg[len++] == ',')
+            numCommas++;
+    }
+
+    if (len >= (maxLen - 3)) // Something went horribly wrong
+        return;
+
+    // Assemble the time
+
+    size_t timestart = len;
+
+    double secondsNow = 0.0;
+    secondsNow += ((double)(msg[len++] - 0x30)) * 36000.0;
+    secondsNow += ((double)(msg[len++] - 0x30)) * 3600.0;
+    secondsNow += ((double)(msg[len++] - 0x30)) * 600.0;
+    secondsNow += ((double)(msg[len++] - 0x30)) * 60.0;
+    secondsNow += ((double)(msg[len++] - 0x30)) * 10.0;
+    secondsNow += ((double)(msg[len++] - 0x30)) * 1.0;
+    int ndp = 0; // Number of decimal places
+    if (msg[len] == '.')
+    {
+        len++;
+        double dp = 0.1;
+        while (msg[len] != ',')
+        {
+            secondsNow += ((double)(msg[len++] - 0x30)) * dp;
+            ndp++;
+            dp *= 0.1;
+        }
+    }
+
+    // Apply the offset
+
+    offsetSeconds = round(offsetSeconds * 1000.0) / 1000.0;
+    secondsNow += offsetSeconds;
+    int dateAdjust = 0;
+    while (secondsNow < 0.0)
+    {
+        secondsNow += 86400.0;
+        dateAdjust -= 1;
+    }
+    while (secondsNow >= 86400.0)
+    {
+        secondsNow -= 86400.0;
+        dateAdjust += 1;
+    }
+
+    // Update the time
+
+    char timeFormat[18];
+    if (ndp > 0)
+        snprintf(timeFormat, sizeof(timeFormat), "%%02d%%02d%%02d.%%0%dd", ndp);
+    else
+        snprintf(timeFormat, sizeof(timeFormat), "%%02d%%02d%%02d");
+    int hours = (int)(secondsNow / 3600.0);
+    secondsNow -= (double)hours * 3600.0;
+    int mins = (int)(secondsNow / 60.0);
+    secondsNow -= (double)mins * 60.0;
+    int secs = (int)(secondsNow);
+    secondsNow -= (double)secs;
+    for (int d = 0; d < ndp; d++)
+        secondsNow *= 10.0;
+    int dps = (int)round(secondsNow);
+    if (ndp > 0)
+        sprintf(&msg[timestart], timeFormat, hours, mins, secs, dps);
+    else
+        sprintf(&msg[timestart], timeFormat, hours, mins, secs);
+    msg[len] = ','; // Restore the comma (it was overwritten by the null)
+
+    // Update the RMC Date
+
+    if (isRMC && (dateAdjust != 0))
+    {
+        while ((numCommas < 9) && (msg[len] != '*') && (len < maxLen))
+        {
+            if (msg[len++] == ',')
+                numCommas++;
+        }
+
+        // Assemble the date
+
+        size_t datestart = len;
+
+        struct tm tm_actual;
+        struct tm *tm = &tm_actual;
+        tm->tm_mday = (((int)(msg[len++] - 0x30)) * 10) + ((int)(msg[len++] - 0x30));
+        tm->tm_mon = (((int)(msg[len++] - 0x30)) * 10) + ((int)(msg[len++] - 0x30)) - 1;
+        tm->tm_year = (((int)(msg[len++] - 0x30)) * 10) + ((int)(msg[len++] - 0x30)) + 100;
+        tm->tm_hour = hours;
+        tm->tm_min = mins;
+        tm->tm_sec = secs;
+        tm->tm_isdst = 0;
+
+        time_t tt = mktime(tm);
+
+        // Adjust the date
+
+        tt += dateAdjust * 86400;
+        tm = localtime(&tt);
+
+        // Update the date
+
+        strftime(&msg[datestart], 7, "%d%m%y", tm);
+        msg[datestart + 6] = ','; // Restore the comma (it was overwritten by the null)
+    }
+
+    // Update the checksum: XOR chars between '$' and '*'
+    len = 1;
+    uint8_t csum = 0;
+    while ((len < maxLen) && (msg[len] != '*'))
+        csum = csum ^ msg[len++];
+    len++;                            // Point at the checksum and update it
+    sprintf(&msg[len], "%02X", csum); // null-terminate after csum
+}
+
+// Call back from within parser, for end of message
+// Process a complete message incoming from parser
+// If we get a complete NMEA/UBX/RTCM message, pass on to SD/BT/TCP/UDP interfaces
+void processUart1Message(SEMP_PARSE_STATE *parse, uint16_t type)
+{
+    int32_t bytesToCopy;
+    const char *consumer;
+    uint16_t message;
+    RING_BUFFER_OFFSET remainingBytes;
+    int32_t space;
+    int32_t use;
+
+    // Display the message
+    if ((settings.enablePrintLogFileMessages || PERIODIC_DISPLAY(PD_GNSS_DATA_RX)) && (!inMainMenu))
+    {
+        PERIODIC_CLEAR(PD_GNSS_DATA_RX);
+        if (settings.enablePrintLogFileMessages)
+        {
+            printTimeStamp();
+            systemPrint("    ");
+        }
+        else
+            systemPrint("GNSS RX: ");
+
+        switch (type)
+        {
+        case RTK_NMEA_PARSER_INDEX:
+            systemPrintf("%s %s %s, 0x%04x (%d) bytes\r\n", parse->parserName, parse->parsers[type]->parserName,
+                         sempNmeaGetSentenceName(parse), parse->length, parse->length);
+            break;
+
+        case RTK_UNICORE_HASH_PARSER_INDEX:
+            systemPrintf("%s %s %s, 0x%04x (%d) bytes\r\n", parse->parserName, parse->parsers[type]->parserName,
+                         sempUnicoreHashGetSentenceName(parse), parse->length, parse->length);
+            break;
+
+        case RTK_RTCM_PARSER_INDEX:
+            systemPrintf("%s %s %d, 0x%04x (%d) bytes\r\n", parse->parserName, parse->parsers[type]->parserName,
+                         sempRtcmGetMessageNumber(parse), parse->length, parse->length);
+            break;
+
+        case RTK_UBLOX_PARSER_INDEX:
+            message = sempUbloxGetMessageNumber(parse);
+            systemPrintf("%s %s %d.%d, 0x%04x (%d) bytes\r\n", parse->parserName, parse->parsers[type]->parserName,
+                         message >> 8, message & 0xff, parse->length, parse->length);
+            break;
+
+        case RTK_UNICORE_BINARY_PARSER_INDEX:
+            systemPrintf("%s %s, 0x%04x (%d) bytes\r\n", parse->parserName, parse->parsers[type]->parserName,
+                         parse->length, parse->length);
+            break;
+        }
+    }
+
+    // Save GGA / RMC / GST for the Apple device
+    // We should optimse this with a Lee table... TODO
+    if ((online.authenticationCoPro) && (type == RTK_NMEA_PARSER_INDEX))
+    {
+        if (strstr(sempNmeaGetSentenceName(parse), "GGA") != nullptr)
+        {
+            if (parse->length < latestNmeaMaxLen)
+            {
+                memcpy(latestGPGGA, parse->buffer, parse->length);
+                latestGPGGA[parse->length] = 0; // NULL terminate
+                if ((strlen(latestGPGGA) > 10) && (latestGPGGA[strlen(latestGPGGA) - 2] == '\r'))
+                    latestGPGGA[strlen(latestGPGGA) - 2] = 0; // Truncate the \r\n
+                forceTalkerId("P", latestGPGGA, latestNmeaMaxLen);
+                utcAdjust(settings.accessoryTimeOffset_s, latestGPGGA, latestNmeaMaxLen);
+            }
+            else
+                systemPrintf("Increase latestNmeaMaxLen to > %d\r\n", parse->length);
+        }
+        else if (strstr(sempNmeaGetSentenceName(parse), "RMC") != nullptr)
+        {
+            if (parse->length < latestNmeaMaxLen)
+            {
+                memcpy(latestGPRMC, parse->buffer, parse->length);
+                latestGPRMC[parse->length] = 0; // NULL terminate
+                if ((strlen(latestGPRMC) > 10) && (latestGPRMC[strlen(latestGPRMC) - 2] == '\r'))
+                    latestGPRMC[strlen(latestGPRMC) - 2] = 0; // Truncate the \r\n
+                forceTalkerId("P", latestGPRMC, latestNmeaMaxLen);
+                forceRmcCog(latestGPRMC, latestNmeaMaxLen);
+                replaceRmcModeIndicator(latestGPRMC, latestNmeaMaxLen);
+                removeRmcNavStat(latestGPRMC, latestNmeaMaxLen);
+                utcAdjust(settings.accessoryTimeOffset_s, latestGPRMC, latestNmeaMaxLen);
+            }
+            else
+                systemPrintf("Increase latestNmeaMaxLen to > %d\r\n", parse->length);
+        }
+        else if (strstr(sempNmeaGetSentenceName(parse), "GST") != nullptr)
+        {
+            if (parse->length < latestNmeaMaxLen)
+            {
+                memcpy(latestGPGST, parse->buffer, parse->length);
+                latestGPGST[parse->length] = 0; // NULL terminate
+                if ((strlen(latestGPGST) > 10) && (latestGPGST[strlen(latestGPGST) - 2] == '\r'))
+                    latestGPGST[strlen(latestGPGST) - 2] = 0; // Truncate the \r\n
+                forceTalkerId("P", latestGPGST, latestNmeaMaxLen);
+                utcAdjust(settings.accessoryTimeOffset_s, latestGPGST, latestNmeaMaxLen);
+            }
+            else
+                systemPrintf("Increase latestNmeaMaxLen to > %d\r\n", parse->length);
+        }
+        else if (strstr(sempNmeaGetSentenceName(parse), "VTG") != nullptr)
+        {
+            if (parse->length < latestNmeaMaxLen)
+            {
+                memcpy(latestGPVTG, parse->buffer, parse->length);
+                latestGPVTG[parse->length] = 0; // NULL terminate
+                if ((strlen(latestGPVTG) > 10) && (latestGPVTG[strlen(latestGPVTG) - 2] == '\r'))
+                    latestGPVTG[strlen(latestGPVTG) - 2] = 0; // Truncate the \r\n
+                forceTalkerId("P", latestGPVTG, latestNmeaMaxLen);
+            }
+            else
+                systemPrintf("Increase latestNmeaMaxLen to > %d\r\n", parse->length);
+        }
+        else if ((strstr(sempNmeaGetSentenceName(parse), "GSA") != nullptr) ||
+                 (strstr(sempNmeaGetSentenceName(parse), "GSV") != nullptr))
+        {
+            // If the Apple Accessory is sending the data to the EA Session,
+            // discard this GSA / GSV. Bad things would happen if we were to
+            // manipulate latestEASessionData while appleAccessory is using it.
+#ifdef COMPILE_AUTHENTICATION
+            if (appleAccessory->latestEASessionDataIsBlocking() == false)
+            {
+                do // Use a do loop so we can break out if needed
+                {
+                    // Check the buffer is large enough. Include room for the CR, LF and NULL
+                    if (latestEASessionDataMaxLen < (parse->length + 3))
+                    {
+                        if (settings.debugNetworkLayer && !inMainMenu)
+                            systemPrintf("Increase latestEASessionDataMaxLen to > %d\r\n", parse->length);
+                        break;
+                    }
+
+                    // Use strnlen to get the length of the stored EA session data
+                    size_t latestEASessionDataLen = strnlen(latestEASessionData, latestEASessionDataMaxLen);
+                    if (latestEASessionDataLen == latestEASessionDataMaxLen)
+                    {
+                        if (settings.debugNetworkLayer && !inMainMenu)
+                            systemPrintln(
+                                "latestEASessionData is full and not NULL-terminated. Discarding buffer contents...");
+                        *latestEASessionData = 0;
+                        latestEASessionDataLen = 0;
+                    }
+
+                    size_t spaceAvailable = latestEASessionDataMaxLen - latestEASessionDataLen;
+
+                    // If the buffer is full, delete the oldest message(s). Include room for the CR, LF and NULL
+                    while (spaceAvailable < (parse->length + 3))
+                    {
+                        const char *lfPtr = strstr(latestEASessionData, "\n"); // Find the first LF
+                        if (lfPtr == nullptr)
+                        {
+                            // LF not found. Something has gone badly wrong...
+                            if (settings.debugNetworkLayer && !inMainMenu)
+                                systemPrintln("latestEASessionData does not contain LF. Discarding buffer contents...");
+                            *latestEASessionData = 0;
+                            latestEASessionDataLen = 0;
+                            spaceAvailable = latestEASessionDataMaxLen;
+                        }
+                        else
+                        {
+                            lfPtr++;                                         // Point at the byte after the LF
+                            size_t oldLen = lfPtr - latestEASessionData;     // This much data is old
+                            size_t newLen = latestEASessionDataLen - oldLen; // This much is new (not old)
+                            // Move the new data over the old. Include the NULL
+                            memmove(latestEASessionData, &latestEASessionData[oldLen], newLen + 1);
+                            spaceAvailable += oldLen;
+                            latestEASessionDataLen = newLen;
+                            // if (settings.debugNetworkLayer && !inMainMenu)
+                            //     systemPrintf("latestEASessionData is full. Discarding %d bytes...\r\n", oldLen);
+                        }
+                    }
+
+                    memcpy(&latestEASessionData[latestEASessionDataLen], parse->buffer,
+                           parse->length); // Add the new NMEA data
+                    latestEASessionDataLen += parse->length;
+                    if (latestEASessionData[latestEASessionDataLen - 1] != '\n') // Check for LF
+                    {
+                        latestEASessionData[latestEASessionDataLen++] = '\r'; // Add CR
+                        latestEASessionData[latestEASessionDataLen++] = '\n'; // Add LF
+                    }
+                    latestEASessionData[latestEASessionDataLen] = 0; // NULL terminate
+                    // if (settings.debugNetworkLayer && !inMainMenu)
+                    //     systemPrintf("latestEASessionData: added %d bytes...\r\n", parse->length);
+                } while (0);
+            }
+            else if (settings.debugNetworkLayer && !inMainMenu)
+                systemPrintf("Discarding %d GSA/GSV bytes - latestEASessionDataIsBlocking\r\n", parse->length);
+#endif // COMPILE_AUTHENTICATION
+        }
+    }
+
+    // Determine if this message should be processed by the Unicore library
+    // Pass NMEA to um980 before applying compensation
+    if (present.gnss_um980)
+    {
+        if ((type == RTK_UNICORE_BINARY_PARSER_INDEX) || (type == RTK_UNICORE_HASH_PARSER_INDEX) ||
+            (type == RTK_NMEA_PARSER_INDEX))
+        {
+            // Give this data to the library to update its internal variables
+            um980UnicoreHandler(parse->buffer, parse->length);
+        }
+    }
+
+    // Determine if this message should be processed by the LG290P library
+    // Pass NMEA to LG290P before applying compensation
+    if (present.gnss_lg290p)
+    {
+        // Give this data to the library to update its internal variables
+        lg290pHandler(parse->buffer, parse->length);
+
+        if (type == RTK_NMEA_PARSER_INDEX)
+        {
+            if (strstr(sempNmeaGetSentenceName(parse), "PQTMRTCMIS") != nullptr)
+            {
+                // Extract correction port RTCM count from PQTMRTCMIS
+                lg290pProcessRTCMIS(parse->buffer, parse->length);
+            }
+
+            // Suppress PQTM/NMEA messages as needed
+            if (lg290pMessageEnabled((char *)parse->buffer, parse->length) == false)
+            {
+                if ((strstr(sempNmeaGetSentenceName(parse), "GGA") != nullptr)
+                    && settings.enableNtripClient == true && settings.ntripClient_TransmitGGA == true)
+                {
+                    // GGA is disabled, but the user has enabled the NTRIP Client.
+                    // Allow GGA to get through, unmodified.
+                }
+                else
+                {
+                    // Remove the contents of this message
+                    // Note: I know we're not using the PPL any more but this code will prevent
+                    // ZDA from reaching the PPL. Is that what we want?
+                    parse->buffer[0] = 0;
+                    parse->length = 0;
+                }
+            }
+        }
+    }
+
+    // Handle LLA compensation due to tilt or outputTipAltitude setting
+    if (type == RTK_NMEA_PARSER_INDEX)
+    {
+        nmeaApplyCompensation((char *)parse->buffer, parse->length);
+    }
+
+    // Handle GST - extract the lat and lon standard deviations - on mosaic-X5 only
+    if ((present.gnss_mosaicX5) && (type == RTK_NMEA_PARSER_INDEX))
+    {
+        nmeaExtractStdDeviations((char *)parse->buffer, parse->length);
+    }
+
+    // Determine where to send RTCM data
+    if (inBaseMode() && type == RTK_RTCM_PARSER_INDEX)
+    {
+        // Pass data along to NTRIP Server, ESP-NOW radio, or LoRa
+        processRTCM(parse->buffer, parse->length);
+    }
+
+    // Determine if we are using the PPL - UM980, LG290P, or mosaic-X5
+    bool usingPPL = false;
+    // UM980 : Determine if we want to use corrections, and are connected to the broker
+    if ((present.gnss_um980) && (pointPerfectIsEnabled()) && (mqttClientIsConnected() == true))
+        usingPPL = true;
+    // LG290P : Determine if we want to use corrections, and are connected to the broker
+    if ((present.gnss_lg290p) && (pointPerfectIsEnabled()) && (mqttClientIsConnected() == true))
+        usingPPL = true;
+    // mosaic-X5 : Determine if we want to use corrections
+    if ((present.gnss_mosaicX5) && (pointPerfectLbandNeeded()))
+        usingPPL = true;
+
+    if (usingPPL)
+    {
+        bool passToPpl = false;
+
+        // Only messages GPGGA/ZDA, and RTCM1019/1020/1042/1046 need to be passed to PPL
+        if (type == RTK_NMEA_PARSER_INDEX)
+        {
+            if (strstr(sempNmeaGetSentenceName(parse), "GGA") != nullptr)
+                passToPpl = true;
+            else if (strstr(sempNmeaGetSentenceName(parse), "ZDA") != nullptr)
+                passToPpl = true;
+        }
+        else if (type == RTK_RTCM_PARSER_INDEX)
+        {
+            if (sempRtcmGetMessageNumber(parse) == 1019)
+                passToPpl = true;
+            else if (sempRtcmGetMessageNumber(parse) == 1020)
+                passToPpl = true;
+            else if (sempRtcmGetMessageNumber(parse) == 1042)
+                passToPpl = true;
+            else if (sempRtcmGetMessageNumber(parse) == 1046)
+                passToPpl = true;
+        }
+
+        if (passToPpl == true)
+        {
+            pplNewRtcmNmea = true; // Set flag for main loop updatePPL()
+            sendGnssToPpl(parse->buffer, parse->length);
+
+            if ((settings.debugCorrections == true) && !inMainMenu)
+            {
+                systemPrint("Sent to PPL: ");
+
+                // Only messages GPGGA/ZDA, and RTCM1019/1020/1042/1046 need to be passed to PPL
+                if (type == RTK_NMEA_PARSER_INDEX)
+                {
+                    systemPrint("GN");
+                    if (strstr(sempNmeaGetSentenceName(parse), "GGA") != nullptr)
+                        systemPrint("GGA");
+                    else if (strstr(sempNmeaGetSentenceName(parse), "ZDA") != nullptr)
+                        systemPrint("ZDA");
+                }
+                else if (type == RTK_RTCM_PARSER_INDEX)
+                {
+                    systemPrint("RTCM");
+                    if (sempRtcmGetMessageNumber(parse) == 1019)
+                        systemPrint("1019");
+                    else if (sempRtcmGetMessageNumber(parse) == 1020)
+                        systemPrint("1020");
+                    else if (sempRtcmGetMessageNumber(parse) == 1042)
+                        systemPrint("1042");
+                    else if (sempRtcmGetMessageNumber(parse) == 1046)
+                        systemPrint("1046");
+                }
+
+                systemPrintf(": %d bytes\r\n", parse->length);
+            }
+        }
+    }
+
+    // If BaseCasterOverride is enabled, remove everything but RTCM from the circular buffer
+    // to avoid saturating the downstream radio link that is consuming over a TCP (NTRIP Caster) connection
+    // Remove NMEA, etc after passing to the GNSS receiver library so that we still have SIV and other stats available
+    if (tcpServerInCasterMode)
+    {
+        if (type != RTK_RTCM_PARSER_INDEX)
+        {
+            // Erase buffer
+            parse->buffer[0] = 0;
+            parse->length = 0;
+        }
+    }
+
+    // Push GGA to Caster if enabled
+    if ((type == RTK_NMEA_PARSER_INDEX) && (strstr(sempNmeaGetSentenceName(parse), "GGA") != nullptr))
+    {
+        pushGPGGA((char *)parse->buffer);
+    }
+
+    // If the user has not specifically enabled RTCM used by the PPL, then suppress it
+    if (inRoverMode() && (gnss->getActiveRtcmMessageCount() == 0) && (type == RTK_RTCM_PARSER_INDEX))
+    {
+        // Erase buffer
+        parse->buffer[0] = 0;
+        parse->length = 0;
+    }
+
+    // Suppress binary messages from UM980. Not needed by end GIS apps.
+    if (type == RTK_UNICORE_BINARY_PARSER_INDEX)
+    {
+        // Erase buffer
+        parse->buffer[0] = 0;
+        parse->length = 0;
+    }
+
+    // If parse->length is zero, we should exit now.
+    // Previously, the code would continue past here and fill rbOffsetArray with 'empty' entries.
+    // E.g. RTCM1019/1042/1046 suppressed above
+    if (parse->length == 0)
+        return;
+
+    // Use a semaphore to prevent handleGnssDataTask from gatecrashing
+    if (ringBufferSemaphore == nullptr)
+        ringBufferSemaphore = xSemaphoreCreateMutex();
+    if (ringBufferSemaphore == nullptr)
+    {
+        systemPrintln("ERROR: Failed to create ringBufferSemaphore");
+        return;
+    }
+
+    // Take the semaphore. Long wait. handleGnssDataTask could block
+    // Enable printing of the ring buffer offsets (s d 10) and the SD buffer sizes (s h 7)
+    // to see this in action. No more gatecrashing!
+    if (xSemaphoreTake(ringBufferSemaphore, ringBuffer_longWait_ms) == pdPASS)
+    {
+        ringBufferSemaphoreHolder = "processUart1Message";
+
+        // Determine if this message will fit into the ring buffer
+        int32_t discardedBytes = 0;
+        bytesToCopy = parse->length;
+        space = availableHandlerSpace; // Take a copy of availableHandlerSpace here
+        use = settings.gnssHandlerBufferSize - space;
+        consumer = (char *)slowConsumer;
+        if (bytesToCopy > space) // Paul removed the && (!inMainMenu)) check 7-25-25
+        {
+            int32_t bufferedData;
+            int32_t bytesToDiscard;
+            int32_t listEnd;
+            int32_t messageLength;
+            int32_t previousTail;
+            int32_t rbOffsetTail;
+
+            // Determine the tail of the ring buffer
+            previousTail = dataHead + space + 1;
+            if (previousTail >= settings.gnssHandlerBufferSize)
+                previousTail -= settings.gnssHandlerBufferSize;
+
+            /*  The rbOffsetArray holds the offsets into the ring buffer of the
+             *  start of each of the parsed messages.  A head (rbOffsetHead) and
+             *  tail (rbOffsetTail) offsets are used for this array to insert and
+             *  remove entries.  Typically this task only manipulates the head as
+             *  new messages are placed into the ring buffer.  The handleGnssDataTask
+             *  normally manipulates the tail as data is removed from the buffer.
+             *  However this task will manipulate the tail under two conditions:
+             *
+             *  1.  The ring buffer gets full and data must be discarded
+             *
+             *  2.  The rbOffsetArray is too small to hold all of the message
+             *      offsets for the data in the ring buffer.  The array is full
+             *      when (Head + 1) == Tail
+             *
+             *  Notes:
+             *      The rbOffsetArray is allocated along with the ring buffer in
+             *      Begin.ino
+             *
+             *      The first entry rbOffsetArray[0] is initialized to zero (0)
+             *      in Begin.ino
+             *
+             *      The array always has one entry in it containing the head offset
+             *      which contains a valid offset into the ringBuffer, handled below
+             *
+             *      The empty condition is Tail == Head
+             *
+             *      The amount of data described by the rbOffsetArray is
+             *      rbOffsetArray[Head] - rbOffsetArray[Tail]
+             *
+             *              rbOffsetArray                  ringBuffer
+             *           .-----------------.           .-----------------.
+             *           |                 |           |                 |
+             *           +-----------------+           |                 |
+             *  Tail --> |   Msg 1 Offset  |---------->+-----------------+ <-- Tail n
+             *           +-----------------+           |      Msg 1      |
+             *           |   Msg 2 Offset  |--------.  |                 |
+             *           +-----------------+        |  |                 |
+             *           |   Msg 3 Offset  |------. '->+-----------------+
+             *           +-----------------+      |    |      Msg 2      |
+             *  Head --> |   Head Offset   |--.   |    |                 |
+             *           +-----------------+  |   |    |                 |
+             *           |                 |  |   |    |                 |
+             *           +-----------------+  |   |    |                 |
+             *           |                 |  |   '--->+-----------------+
+             *           +-----------------+  |        |      Msg 3      |
+             *           |                 |  |        |                 |
+             *           +-----------------+  '------->+-----------------+ <-- dataHead
+             *           |                 |           |                 |
+             */
+
+            // Determine the index for the end of the circular ring buffer
+            // offset list
+            listEnd = rbOffsetHead;
+            WRAP_OFFSET(listEnd, 1, rbOffsetEntries);
+
+            // Update the tail, walk newest message to oldest message
+            rbOffsetTail = rbOffsetHead;
+            bufferedData = 0;
+            messageLength = 0;
+            while ((rbOffsetTail != listEnd) && (bufferedData < use))
+            {
+                // Determine the amount of data in the ring buffer up until
+                // either the tail or the end of the rbOffsetArray
+                //
+                //                      |           |
+                //                      |           | Valid, still in ring buffer
+                //                      |  Newest   |
+                //                      +-----------+ <-- rbOffsetHead
+                //                      |           |
+                //                      |           | free space
+                //                      |           |
+                //     rbOffsetTail --> +-----------+ <-- bufferedData
+                //                      |   ring    |
+                //                      |  buffer   | <-- used
+                //                      |   data    |
+                //                      +-----------+ Valid, still in ring buffer
+                //                      |           |
+                //
+                messageLength = rbOffsetArray[rbOffsetTail];
+                WRAP_OFFSET(rbOffsetTail, rbOffsetEntries - 1, rbOffsetEntries);
+                messageLength -= rbOffsetArray[rbOffsetTail];
+                if (messageLength < 0)
+                    messageLength += settings.gnssHandlerBufferSize;
+                bufferedData += messageLength;
+            }
+
+            // Account for any data in the ring buffer not described by the array
+            //
+            //                      |           |
+            //                      +-----------+
+            //                      |  Oldest   |
+            //                      |           |
+            //                      |   ring    |
+            //                      |  buffer   | <-- used
+            //                      |   data    |
+            //                      +-----------+ Valid, still in ring buffer
+            //                      |           |
+            //     rbOffsetTail --> +-----------+ <-- bufferedData
+            //                      |           |
+            //                      |  Newest   |
+            //                      +-----------+ <-- rbOffsetHead
+            //                      |           |
+            //
+            if (bufferedData < use)
+                discardedBytes = use - bufferedData;
+
+            // Writing to the SD card, the network or Bluetooth, a partial
+            // message may be written leaving the tail pointer mid-message
+            //
+            //                      |           |
+            //     rbOffsetTail --> +-----------+
+            //                      |  Oldest   |
+            //                      |           |
+            //                      |   ring    |
+            //                      |  buffer   | <-- used
+            //                      |   data    | Valid, still in ring buffer
+            //                      +-----------+ <--
+            //                      |           |
+            //                      +-----------+
+            //                      |           |
+            //                      |  Newest   |
+            //                      +-----------+ <-- rbOffsetHead
+            //                      |           |
+            //
+            else if (bufferedData > use)
+            {
+                // Remove the remaining portion of the oldest entry in the array
+                discardedBytes = messageLength + use - bufferedData;
+                WRAP_OFFSET(rbOffsetTail, 1, rbOffsetEntries);
+            }
+
+            // rbOffsetTail now points to the beginning of a message in the
+            // ring buffer
+            // Determine the amount of data to discard
+            bytesToDiscard = discardedBytes;
+            if (bytesToDiscard < bytesToCopy)
+                bytesToDiscard = bytesToCopy;
+            if (bytesToDiscard < AMOUNT_OF_RING_BUFFER_DATA_TO_DISCARD)
+                bytesToDiscard = AMOUNT_OF_RING_BUFFER_DATA_TO_DISCARD;
+
+            // Walk the ring buffer messages from oldest to newest
+            while ((discardedBytes < bytesToDiscard) && (rbOffsetTail != rbOffsetHead))
+            {
+                // Determine the length of the oldest message
+                WRAP_OFFSET(rbOffsetTail, 1, rbOffsetEntries);
+                discardedBytes = rbOffsetArray[rbOffsetTail] - previousTail;
+                if (discardedBytes < 0)
+                    discardedBytes += settings.gnssHandlerBufferSize;
+            }
+
+            // Discard the oldest data from the ring buffer
+            // Printing the slow consumer is not that useful as any consumer will be
+            // considered 'slow' if its data wraps over the end of the buffer and
+            // needs a second write to clear...
+            if (!inMainMenu)
+            {
+                if (consumer)
+                    systemPrintf("Ring buffer full: discarding %d bytes, %s could be slow\r\n", discardedBytes,
+                                 consumer);
+                else
+                    systemPrintf("Ring buffer full: discarding %d bytes\r\n", discardedBytes);
+            }
+
+            // Update the tails. This needs semaphore protection
+            updateRingBufferTails(previousTail, rbOffsetArray[rbOffsetTail]);
+        }
+
+        if (bytesToCopy > (space + discardedBytes - 1)) // Sanity check
+        {
+            systemPrintf("Ring buffer update error %s: bytesToCopy (%d) is > space (%d) + discardedBytes (%d) - 1\r\n",
+                         getTimeStamp(), bytesToCopy, space, discardedBytes);
+            systemFlush(); // Flush Serial - the code is about to go bang...!
+        }
+
+        // Add another message to the ring buffer
+        // Account for this message
+        // Diagnostic prints are provided by settings.enablePrintSDBuffers and the handleGnssDataTask
+        // The semaphore prevents badness here. Previously availableHandlerSpace may have been updated
+        // by handleGnssDataTask
+        availableHandlerSpace = availableHandlerSpace + discardedBytes - bytesToCopy;
+
+        // Copy dataHead so we can update with a single write - redundant with the semaphore
+        RING_BUFFER_OFFSET newDataHead = dataHead;
+
+        // Fill the buffer to the end and then start at the beginning
+        if ((newDataHead + bytesToCopy) > settings.gnssHandlerBufferSize)
+            bytesToCopy = settings.gnssHandlerBufferSize - newDataHead;
+
+        // Display the dataHead offset
+        if (settings.enablePrintRingBufferOffsets && (!inMainMenu))
+            systemPrintf("DH: %4d --> ", newDataHead);
+
+        // Copy the data into the ring buffer
+        memcpy(&ringBuffer[newDataHead], parse->buffer, bytesToCopy);
+        newDataHead = newDataHead + bytesToCopy;
+        if (newDataHead >= settings.gnssHandlerBufferSize)
+            newDataHead = newDataHead - settings.gnssHandlerBufferSize;
+
+        // Determine the remaining bytes
+        remainingBytes = parse->length - bytesToCopy;
+        if (remainingBytes)
+        {
+            // Copy the remaining bytes into the beginning of the ring buffer
+            memcpy(ringBuffer, &parse->buffer[bytesToCopy], remainingBytes);
+            newDataHead = newDataHead + remainingBytes;
+            if (newDataHead >= settings.gnssHandlerBufferSize)
+                newDataHead = newDataHead - settings.gnssHandlerBufferSize;
+        }
+
+        // Add the head offset to the offset array
+        WRAP_OFFSET(rbOffsetHead, 1, rbOffsetEntries);
+        rbOffsetArray[rbOffsetHead] = newDataHead;
+
+        // Display the dataHead offset
+        if (settings.enablePrintRingBufferOffsets && (!inMainMenu))
+            systemPrintf("%4d @ %s\r\n", newDataHead, getTimeStamp());
+
+        // Update dataHead in a single write - redundant with the semaphore
+        // handleGnssDataTask will use it as soon as it updates
+        dataHead = newDataHead;
+
+        // handleGnssDataTask will be chomping at the bit. Let it fly!
+        xSemaphoreGive(ringBufferSemaphore);
+    }
+    else
+    {
+        if (settings.debugGnss && (!inMainMenu))
+            systemPrintf("processUart1Message could not get ringBuffer semaphore - held by %s\r\n",
+                         ringBufferSemaphoreHolder);
+    }
+}
+
+// Remove previous messages from the ring buffer
+void updateRingBufferTails(RING_BUFFER_OFFSET previousTail, RING_BUFFER_OFFSET newTail)
+{
+    // Trim any long or medium tails
+    discardRingBufferBytes(&btRingBufferTail, previousTail, newTail);
+    tcpClientDiscardBytes(previousTail, newTail);
+    tcpServerDiscardBytes(previousTail, newTail);
+    udpServerDiscardBytes(previousTail, newTail);
+    discardRingBufferBytes(&sdRingBufferTail, previousTail, newTail);
+    discardRingBufferBytes(&usbRingBufferTail, previousTail, newTail);
+}
+
+// Remove previous messages from the ring buffer
+void discardRingBufferBytes(RING_BUFFER_OFFSET *tail, RING_BUFFER_OFFSET previousTail, RING_BUFFER_OFFSET newTail)
+{
+    // The longest tail is being trimmed.  Medium length tails may contain
+    // some data within the region begin trimmed.  The shortest tails will
+    // be trimmed.
+    //
+    // Devices that get their tails trimmed, may output a partial message
+    // prior to the buffer trimming.  After the trimming, the tail of the
+    // ring buffer points to the beginning of a new message.
+    //
+    //                 previousTail                newTail
+    //                      |                         |
+    //  Before trimming     v         Discarded       v   After trimming
+    //  ----+-----------------  ...  -----+--  ..  ---+-----------+------
+    //      | Partial message             |           |           |
+    //  ----+-----------------  ...  -----+--  ..  ---+-----------+------
+    //                      ^          ^                     ^
+    //                      |          |                     |
+    //        long tail ----'          '--- medium tail      '-- short tail
+    //
+    // Determine if the trimmed data wraps the end of the buffer
+    if (previousTail < newTail)
+    {
+        // No buffer wrap occurred
+        // Only discard the data from long and medium tails
+        if ((*tail >= previousTail) && (*tail < newTail))
+            *tail = newTail;
+    }
+    else
+    {
+        // Buffer wrap occurred
+        if ((*tail >= previousTail) || (*tail < newTail))
+            *tail = newTail;
+    }
+}
+
+// If new data is in the ringBuffer, dole it out to appropriate interface
+// Send data out Bluetooth, record to SD, or send to network clients
+// Each device (Bluetooth, SD and network client) gets its own tail.  If the
+// device is running too slowly then data for that device is dropped.
+// The usedSpace variable tracks the total space in use in the buffer.
+void handleGnssDataTask(void *e)
+{
+    int32_t bytesToSend;
+    uint32_t deltaMillis;
+    int32_t freeSpace;
+    static uint32_t maxMillis[RBC_MAX];
+    unsigned long startMillis;
+    int32_t usedSpace;
+
+    // Start notification
+    task.handleGnssDataTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintln("Task handleGnssDataTask started");
+
+    // Initialize the tails
+    btRingBufferTail = 0;
+    tcpClientZeroTail();
+    tcpServerZeroTail();
+    udpServerZeroTail();
+    sdRingBufferTail = 0;
+    usbRingBufferTail = 0;
+
+    // Run task until a request is raised
+    task.handleGnssDataTaskStopRequest = false;
+    while (task.handleGnssDataTaskStopRequest == false)
+    {
+        // Display an alive message
+        if (PERIODIC_DISPLAY(PD_TASK_HANDLE_GNSS_DATA) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_TASK_HANDLE_GNSS_DATA);
+            systemPrintln("handleGnssDataTask running");
+        }
+
+        //----------------------------------------------------------------------
+        // Send RTCM to consumers
+        //
+        // RTCM has its own storage in rtcmConsumerBuffer (Base.ino)
+        // It does not use the main ringBuffer
+        // But we do the writing here so all traffic generated in the same place
+        //----------------------------------------------------------------------
+
+        startMillis = millis();
+
+        sendRTCMToConsumers();
+
+        if ((millis() - startMillis) > RTCM_CORRECTION_WRITE_TIMEOUT)
+        {
+            uint32_t milliseconds = millis() - startMillis;
+            uint32_t seconds = milliseconds / MILLISECONDS_IN_A_SECOND;
+            milliseconds -= seconds * MILLISECONDS_IN_A_SECOND;
+            systemPrintf("\aWARNING: RTCM writes took %d.%03d seconds!\r\n", seconds, milliseconds);
+        }
+
+        usedSpace = 0;
+
+        // Use a semaphore to prevent handleGnssDataTask from gatecrashing
+        if (ringBufferSemaphore == nullptr)
+            ringBufferSemaphore = xSemaphoreCreateMutex();
+        if (ringBufferSemaphore == nullptr)
+        {
+            systemPrintln("ERROR: Failed to create ringBufferSemaphore");
+            continue;
+        }
+
+        // Take the semaphore. Short wait. processUart1Message shouldn't block for long
+        if (xSemaphoreTake(ringBufferSemaphore, ringBuffer_shortWait_ms) == pdPASS)
+        {
+            ringBufferSemaphoreHolder = "handleGnssDataTask";
+
+            //----------------------------------------------------------------------
+            // Send data over Bluetooth
+            //----------------------------------------------------------------------
+
+            startMillis = millis();
+
+            // Determine BT connection state
+            // Note: we don't check sppAccessoryMode here. BLE writes can continue when
+            // the Accessory needs exclusive access to SPP. The SPP writes are skipped
+            // inside bluetoothWrite
+            bool connected = (bluetoothGetState() == BT_CONNECTED);
+
+            if (!connected)
+                // Discard the data
+                btRingBufferTail = dataHead;
+            else
+            {
+                // Determine the amount of Bluetooth data in the buffer
+                bytesToSend = dataHead - btRingBufferTail;
+                if (bytesToSend < 0)
+                    bytesToSend += settings.gnssHandlerBufferSize;
+                if (bytesToSend > 0)
+                {
+                    // Reduce bytes to send if we have more to send then the end of
+                    // the buffer, we'll wrap next loop
+                    if ((btRingBufferTail + bytesToSend) > settings.gnssHandlerBufferSize)
+                        bytesToSend = settings.gnssHandlerBufferSize - btRingBufferTail;
+
+                    // If we are in the config menu, suppress data flowing from GNSS to cell phone
+                    if (btPrintEcho == false)
+                    {
+                        // Push new data over Bluetooth
+                        bytesToSend = bluetoothWrite(&ringBuffer[btRingBufferTail], bytesToSend);
+                    }
+
+                    // Account for the data that was sent
+                    if (bytesToSend > 0)
+                    {
+                        // If we are in base mode, assume part of the outgoing data is RTCM
+                        if (inBaseMode() == true)
+                            bluetoothOutgoingRTCM = true;
+
+                        // Account for the sent or dropped data
+                        btRingBufferTail += bytesToSend;
+                        if (btRingBufferTail >= settings.gnssHandlerBufferSize)
+                            btRingBufferTail -= settings.gnssHandlerBufferSize;
+
+                        // Remember the maximum transfer time
+                        deltaMillis = millis() - startMillis;
+                        if (maxMillis[RBC_BLUETOOTH] < deltaMillis)
+                            maxMillis[RBC_BLUETOOTH] = deltaMillis;
+
+                        // Display the data movement
+                        if (PERIODIC_DISPLAY(PD_BLUETOOTH_DATA_TX) && !inMainMenu)
+                        {
+                            PERIODIC_CLEAR(PD_BLUETOOTH_DATA_TX);
+                            systemPrintf("Bluetooth: %d bytes written\r\n", bytesToSend);
+                        }
+                    }
+                    else
+                        log_w("BT failed to send");
+
+                    // Determine the amount of data that remains in the buffer
+                    bytesToSend = dataHead - btRingBufferTail;
+                    if (bytesToSend < 0)
+                        bytesToSend += settings.gnssHandlerBufferSize;
+                    if (usedSpace < bytesToSend)
+                    {
+                        usedSpace = bytesToSend;
+                        slowConsumer = "Bluetooth";
+                    }
+                }
+            }
+
+            //----------------------------------------------------------------------
+            // Send data over USB serial
+            //----------------------------------------------------------------------
+
+            startMillis = millis();
+
+            // Determine USB serial connection state
+            if (forwardGnssDataToUsbSerial == false)
+                // Discard the data
+                usbRingBufferTail = dataHead;
+            else
+            {
+                // Determine the amount of USB serial data in the buffer
+                bytesToSend = dataHead - usbRingBufferTail;
+                if (bytesToSend < 0)
+                    bytesToSend += settings.gnssHandlerBufferSize;
+                if (bytesToSend > 0)
+                {
+                    // Reduce bytes to send if we have more to send then the end of
+                    // the buffer, we'll wrap next loop
+                    if ((usbRingBufferTail + bytesToSend) > settings.gnssHandlerBufferSize)
+                        bytesToSend = settings.gnssHandlerBufferSize - usbRingBufferTail;
+
+                    // Send data over USB serial to the PC
+                    bytesToSend = systemWriteGnssDataToUsbSerial(&ringBuffer[usbRingBufferTail], bytesToSend);
+
+                    // Account for the data that was sent
+                    if (bytesToSend > 0)
+                    {
+                        // Account for the sent or dropped data
+                        usbRingBufferTail += bytesToSend;
+                        if (usbRingBufferTail >= settings.gnssHandlerBufferSize)
+                            usbRingBufferTail -= settings.gnssHandlerBufferSize;
+
+                        // Remember the maximum transfer time
+                        deltaMillis = millis() - startMillis;
+                        if (maxMillis[RBC_USB_SERIAL] < deltaMillis)
+                            maxMillis[RBC_USB_SERIAL] = deltaMillis;
+                    }
+
+                    // Determine the amount of data that remains in the buffer
+                    bytesToSend = dataHead - usbRingBufferTail;
+                    if (bytesToSend < 0)
+                        bytesToSend += settings.gnssHandlerBufferSize;
+                    if (usedSpace < bytesToSend)
+                    {
+                        usedSpace = bytesToSend;
+                        slowConsumer = "USB Serial";
+                    }
+                }
+            }
+
+            //----------------------------------------------------------------------
+            // Send data to the network clients
+            //----------------------------------------------------------------------
+
+            startMillis = millis();
+
+            // Update space available for use in UART task
+            bytesToSend = tcpClientSendData(dataHead);
+            if (usedSpace < bytesToSend)
+            {
+                usedSpace = bytesToSend;
+                slowConsumer = "TCP client";
+            }
+
+            // Remember the maximum transfer time
+            deltaMillis = millis() - startMillis;
+            if (maxMillis[RBC_TCP_CLIENT] < deltaMillis)
+                maxMillis[RBC_TCP_CLIENT] = deltaMillis;
+
+            startMillis = millis();
+
+            // If a remote client is in config mode, suppress GNSS data flowing to the client
+            if (tcpServerInRemoteConfig() == false)
+            {
+                // Update space available for use in UART task
+                bytesToSend = tcpServerSendData(dataHead);
+                if (usedSpace < bytesToSend)
+                {
+                    usedSpace = bytesToSend;
+                    slowConsumer = "TCP server";
+                }
+            }
+
+            // Remember the maximum transfer time
+            deltaMillis = millis() - startMillis;
+            if (maxMillis[RBC_TCP_SERVER] < deltaMillis)
+                maxMillis[RBC_TCP_SERVER] = deltaMillis;
+
+            startMillis = millis();
+
+            // Update space available for use in UART task
+            bytesToSend = udpServerSendData(dataHead);
+            if (usedSpace < bytesToSend)
+            {
+                usedSpace = bytesToSend;
+                slowConsumer = "UDP server";
+            }
+
+            // Remember the maximum transfer time
+            deltaMillis = millis() - startMillis;
+            if (maxMillis[RBC_UDP_SERVER] < deltaMillis)
+                maxMillis[RBC_UDP_SERVER] = deltaMillis;
+
+            //----------------------------------------------------------------------
+            // Log data to the SD card
+            //----------------------------------------------------------------------
+
+            // Determine if the SD card is enabled for logging
+            connected = online.logging && (!logTimeExceeded());
+
+            // Block logging during Web Config to avoid SD collisions
+            // See issue: https://github.com/sparkfun/SparkFun_RTK_Everywhere_Firmware/issues/693
+            if (webServerIsRunning() == true)
+                connected = false;
+
+            // If user wants to log, record to SD
+            if (!connected)
+                // Discard the data
+                sdRingBufferTail = dataHead;
+            else
+            {
+                // Determine the amount of microSD card logging data in the buffer
+                bytesToSend = dataHead - sdRingBufferTail;
+                if (bytesToSend < 0)
+                    bytesToSend += settings.gnssHandlerBufferSize;
+                if (bytesToSend > 0)
+                {
+                    // Attempt to gain access to the SD card, avoids collisions with file
+                    // writing from other functions like recordSystemSettingsToFile()
+                    if (xSemaphoreTake(sdCardSemaphore, loggingSemaphoreWait_ms) == pdPASS)
+                    {
+                        markSemaphore(FUNCTION_WRITESD);
+
+                        // pinDebugOn();
+
+                        do // Do the SD write in a do loop so we can break out if needed
+                        {
+                            if (settings.enablePrintSDBuffers && (!inMainMenu))
+                            {
+                                int bufferAvailable = serialGNSS->available();
+
+                                int availableUARTSpace = settings.uartReceiveBufferSize - bufferAvailable;
+
+                                systemPrintf(
+                                    "SD Incoming Serial @ %s: %04d\tToRead: %04d\tMovedToBuffer: "
+                                    "%04d\tavailableUARTSpace: "
+                                    "%04d\tavailableHandlerSpace: %04d\tToRecord: %04d\tRecorded: %04d\tBO: %d\r\n",
+                                    getTimeStamp(), bufferAvailable, 0, 0, availableUARTSpace, availableHandlerSpace,
+                                    bytesToSend, 0, bufferOverruns);
+                            }
+
+                            // For the SD card, we need to write everything we've got
+                            // to prevent the ARP Write and Events from gatecrashing...
+
+                            int32_t sendTheseBytes = bytesToSend;
+
+                            // Reduce bytes to record if we have more then the end of the buffer
+                            if ((sdRingBufferTail + sendTheseBytes) > settings.gnssHandlerBufferSize)
+                                sendTheseBytes = settings.gnssHandlerBufferSize - sdRingBufferTail;
+
+                            startMillis = millis();
+
+                            // Write the data to the file
+                            int32_t bytesSent = logFile->write(&ringBuffer[sdRingBufferTail], sendTheseBytes);
+
+                            // Account for the sent data or dropped
+                            sdRingBufferTail += bytesSent;
+                            if (sdRingBufferTail >= settings.gnssHandlerBufferSize)
+                                sdRingBufferTail -= settings.gnssHandlerBufferSize;
+
+                            if (bytesSent != sendTheseBytes)
+                            {
+                                systemPrintf("SD write mismatch (1) @ %s: wrote %d bytes of %d\r\n", getTimeStamp(),
+                                             bytesSent, sendTheseBytes);
+                                break; // Exit the do loop
+                            }
+
+                            // If we have more data to write - and the first write was successful
+                            if (bytesToSend > sendTheseBytes)
+                            {
+                                sendTheseBytes = bytesToSend - sendTheseBytes;
+
+                                bytesSent = logFile->write(&ringBuffer[sdRingBufferTail], sendTheseBytes);
+
+                                // Account for the sent data or dropped
+                                sdRingBufferTail += bytesSent;
+                                if (sdRingBufferTail >= settings.gnssHandlerBufferSize) // Should be redundant
+                                    sdRingBufferTail -= settings.gnssHandlerBufferSize;
+
+                                if (bytesSent != sendTheseBytes)
+                                {
+                                    systemPrintf("SD write mismatch (2) @ %s: wrote %d bytes of %d\r\n", getTimeStamp(),
+                                                 bytesSent, sendTheseBytes);
+                                    break; // Exit the do loop
+                                }
+                            }
+
+                            if (PERIODIC_DISPLAY(PD_SD_LOG_WRITE) && (bytesSent > 0) && (!inMainMenu))
+                            {
+                                PERIODIC_CLEAR(PD_SD_LOG_WRITE);
+                                systemPrintf("SD %d bytes written to log file\r\n", bytesToSend);
+                            }
+
+                            sdFreeSpace -= bytesToSend; // Update remaining space on SD
+
+                            // Record any pending trigger events
+                            if (newEventToRecord == true)
+                            {
+                                newEventToRecord = false;
+
+                                if ((settings.enablePrintLogFileStatus) && (!inMainMenu))
+                                    systemPrintln("Log file: recording event");
+
+                                // Record trigger count with Time Of Week of rising edge (ms), Millisecond fraction of
+                                // Time Of Week of rising edge (ns), and accuracy estimate (ns)
+                                char eventData[82]; // Max NMEA sentence length is 82
+                                snprintf(eventData, sizeof(eventData), "%lu,%lu,%lu,%lu", triggerCount, triggerTowMsR,
+                                         triggerTowSubMsR, triggerAccEst);
+
+                                char nmeaMessage[82]; // Max NMEA sentence length is 82
+                                createNMEASentence(CUSTOM_NMEA_TYPE_EVENT, nmeaMessage, sizeof(nmeaMessage),
+                                                   eventData); // textID, buffer, sizeOfBuffer, text
+
+                                logFile->write(nmeaMessage, strlen(nmeaMessage));
+                                const char *crlf = "\r\n";
+                                logFile->write(crlf, 2);
+
+                                sdFreeSpace -= strlen(nmeaMessage) + 2; // Update remaining space on SD
+                            }
+
+                            // Record the Antenna Reference Position - if available
+                            if (newARPAvailable == true && settings.enableARPLogging &&
+                                ((millis() - lastARPLog) > (settings.ARPLoggingInterval_s * 1000)))
+                            {
+                                lastARPLog = millis();
+                                newARPAvailable = false; // Clear flag. It doesn't matter if the ARP cannot be logged
+
+                                double x = ARPECEFX;
+                                x /= 10000.0; // Convert to m
+                                double y = ARPECEFY;
+                                y /= 10000.0; // Convert to m
+                                double z = ARPECEFZ;
+                                z /= 10000.0; // Convert to m
+                                double h = ARPECEFH;
+                                h /= 10000.0;     // Convert to m
+                                char ARPData[82]; // Max NMEA sentence length is 82
+                                snprintf(ARPData, sizeof(ARPData), "%.4f,%.4f,%.4f,%.4f", x, y, z, h);
+
+                                if ((settings.enablePrintLogFileStatus) && (!inMainMenu))
+                                    systemPrintf("Log file: recording Antenna Reference Position %s\r\n", ARPData);
+
+                                char nmeaMessage[82]; // Max NMEA sentence length is 82
+                                createNMEASentence(CUSTOM_NMEA_TYPE_ARP_ECEF_XYZH, nmeaMessage, sizeof(nmeaMessage),
+                                                   ARPData); // textID, buffer, sizeOfBuffer, text
+
+                                logFile->write(nmeaMessage, strlen(nmeaMessage));
+                                const char *crlf = "\r\n";
+                                logFile->write(crlf, 2);
+
+                                sdFreeSpace -= strlen(nmeaMessage) + 2; // Update remaining space on SD
+                            }
+
+                            logFileSize = logFile->fileSize(); // Update file size
+
+                            // Force file sync every 60s - or every two seconds if the size is not increasing
+                            if (((logFileSize == lastLogSize) && ((millis() - lastUBXLogSyncTime) > 2000)) ||
+                                ((millis() - lastUBXLogSyncTime) > 60000))
+                            {
+                                baseStatusLedBlink(); // Blink LED to indicate logging activity
+
+                                logFile->sync();
+                                sdUpdateFileAccessTimestamp(logFile); // Update the file access time & date
+
+                                baseStatusLedBlink(); // Blink LED to indicate logging activity
+
+                                lastUBXLogSyncTime = millis();
+                            }
+
+                            // Remember the maximum transfer time
+                            deltaMillis = millis() - startMillis;
+                            if (maxMillis[RBC_SD_CARD] < deltaMillis)
+                                maxMillis[RBC_SD_CARD] = deltaMillis;
+
+                            if (settings.enablePrintBufferOverrun)
+                            {
+                                if (deltaMillis > 150)
+                                    systemPrintf("Long Write! Time: %ld ms / Location: %ld / Recorded %d bytes / "
+                                                 "spaceRemaining %d bytes\r\n",
+                                                 deltaMillis, logFileSize, bytesToSend, combinedSpaceRemaining);
+                            }
+                        } while (0);
+
+                        xSemaphoreGive(sdCardSemaphore);
+                    } // End sdCardSemaphore
+                    else
+                    {
+                        char semaphoreHolder[50];
+                        getSemaphoreFunction(semaphoreHolder);
+                        log_w("sdCardSemaphore failed to yield for SD write, held by %s, Tasks.ino line %d",
+                              semaphoreHolder, __LINE__);
+
+                        feedWdt();
+                        taskYIELD();
+                    }
+
+                    // Update space available for use in UART task
+                    bytesToSend = dataHead - sdRingBufferTail;
+                    if (bytesToSend < 0)
+                        bytesToSend += settings.gnssHandlerBufferSize;
+                    if (usedSpace < bytesToSend)
+                    {
+                        usedSpace = bytesToSend;
+                        slowConsumer = "SD card";
+                    }
+                } // bytesToSend
+            } // End connected
+
+            //----------------------------------------------------------------------
+            // Update the available space in the ring buffer
+            //----------------------------------------------------------------------
+
+            freeSpace = settings.gnssHandlerBufferSize - usedSpace;
+
+            // Don't fill the last byte to prevent buffer overflow
+            if (freeSpace)
+                freeSpace -= 1;
+            availableHandlerSpace = freeSpace;
+
+            //----------------------------------------------------------------------
+            // Display the millisecond values for the different ring buffer consumers
+            //----------------------------------------------------------------------
+
+            if (PERIODIC_DISPLAY(PD_RING_BUFFER_MILLIS) && !inMainMenu)
+            {
+                int milliseconds;
+                int seconds;
+
+                PERIODIC_CLEAR(PD_RING_BUFFER_MILLIS);
+                for (int index = 0; index < RBC_MAX; index++)
+                {
+                    milliseconds = maxMillis[index];
+                    if (milliseconds > 1)
+                    {
+                        seconds = milliseconds / MILLISECONDS_IN_A_SECOND;
+                        milliseconds %= MILLISECONDS_IN_A_SECOND;
+                        systemPrintf("%s: %d:%03d Sec\r\n", ringBufferConsumer[index], seconds, milliseconds);
+                    }
+                }
+            }
+
+            //----------------------------------------------------------------------
+            // processUart1Message will be chomping at the bit. Let it fly!
+            //----------------------------------------------------------------------
+
+            xSemaphoreGive(ringBufferSemaphore);
+        }
+        else
+        {
+            if (settings.debugGnss && (!inMainMenu))
+                systemPrintf("handleGnssDataTask could not get ringBuffer semaphore - held by %s\r\n",
+                             ringBufferSemaphoreHolder);
+        }
+
+        //----------------------------------------------------------------------
+        // Let other tasks run, prevent watch dog timer (WDT) resets
+        //----------------------------------------------------------------------
+
+        feedWdt();
+        taskYIELD();
+    }
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintln("Task handleGnssDataTask stopped");
+    task.handleGnssDataTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+// Control Bluetooth LED on variants
+// This is only called if ticker task is started so no pin tests are done
+void tickerBluetoothLedUpdate()
+{
+    // If we are in WiFi config mode, fade LED
+    if (inWebConfigMode() == true)
+    {
+        // Fade in/out the BT LED during WiFi AP mode
+        btFadeLevel += pwmFadeAmount;
+        if (btFadeLevel <= 0 || btFadeLevel >= 255)
+            pwmFadeAmount *= -1;
+
+        if (btFadeLevel > 255)
+            btFadeLevel = 255;
+        if (btFadeLevel < 0)
+            btFadeLevel = 0;
+
+        ledcWrite(pin_bluetoothStatusLED, btFadeLevel);
+    }
+    // Blink on/off while we wait for BT connection
+    else if (bluetoothGetState() == BT_NOTCONNECTED)
+    {
+        if (btFadeLevel == 0)
+            btFadeLevel = 255;
+        else
+            btFadeLevel = 0;
+        ledcWrite(pin_bluetoothStatusLED, btFadeLevel);
+    }
+    // Solid LED if BT Connected
+    else if (bluetoothGetState() == BT_CONNECTED)
+        ledcWrite(pin_bluetoothStatusLED, 255);
+    else
+        ledcWrite(pin_bluetoothStatusLED, 0);
+}
+
+// Control GNSS LED on variants
+void tickerGnssLedUpdate()
+{
+    static uint8_t ledCallCounter = 0; // Used to calculate a 50% or 10% on rate for blinking
+
+    ledCallCounter++;
+    ledCallCounter %= gnssTaskUpdatesHz; // Wrap to X calls per 1 second
+
+    if (productVariant == RTK_TORCH || productVariant == RTK_TORCH_X2)
+    {
+        // Update the GNSS LED according to our state
+
+        // Blinking during RTK Float or PPP Converging
+        if (gnss->isRTKFloat() == true || gnss->isPppConverging())
+        {
+            // Blink at a 500ms on, 500ms off.
+            if (ledCallCounter >= 10)
+                ledcWrite(pin_gnssStatusLED, 255);
+            else
+                ledcWrite(pin_gnssStatusLED, 0);
+        }
+
+        // Solid once RTK Fix is achieved, or PPP converges
+        else if (gnss->isRTKFix() == true || gnss->isPppConverged())
+        {
+            ledcWrite(pin_gnssStatusLED, 255);
+        }
+        else
+        {
+            ledcWrite(pin_gnssStatusLED, 0);
+        }
+    }
+}
+
+// Control Battery LED on variants
+void tickerBatteryLedUpdate()
+{
+    static uint8_t batteryCallCounter = 0; // Used to calculate a 50% or 10% on rate for blinking
+
+    batteryCallCounter++;
+    batteryCallCounter %= batteryTaskUpdatesHz; // Wrap to X calls per 1 second
+
+    if (productVariant == RTK_TORCH || productVariant == RTK_TORCH_X2)
+    {
+        // Update the Battery LED according to the battery level
+
+        // Solid LED when fuel level is above 50%
+        if (batteryLevelPercent > 50)
+        {
+            ledcWrite(pin_batteryStatusLED, 255);
+        }
+        // Blink a short blink to indicate battery is depleting
+        else
+        {
+            if (batteryCallCounter == (batteryTaskUpdatesHz / 10)) // On for 1/10th of a second
+                ledcWrite(pin_batteryStatusLED, 255);
+            else
+                ledcWrite(pin_batteryStatusLED, 0);
+        }
+    }
+}
+
+enum BeepState
+{
+    BEEP_OFF = 0,
+    BEEP_ON,
+    BEEP_QUIET,
+};
+BeepState beepState = BEEP_OFF;
+
+// Control the length of time the beeper makes noise
+// We move through a simple state machine in order to handle multiple types of beeps (see beepMultiple())
+void tickerBeepUpdate()
+{
+    if (present.beeper == true)
+    {
+        switch (beepState)
+        {
+        default:
+            if (beepState != BEEP_OFF)
+                beepState = BEEP_OFF;
+            break;
+
+        case BEEP_OFF:
+            if (beepLengthMs > 0)
+            {
+                beepNextEventMs = millis() + beepLengthMs;
+                beepOn();
+                beepState = BEEP_ON;
+            }
+            break;
+
+        case BEEP_ON:
+            // https://stackoverflow.com/a/3097744 - see issue #742
+            if (!((long)(beepNextEventMs - millis()) > 0))
+            {
+                if (beepCount == 1)
+                {
+                    beepLengthMs = 0; // Stop state machine
+                    beepState = BEEP_OFF;
+                    beepOff();
+                }
+                else
+                {
+                    beepNextEventMs = millis() + beepQuietLengthMs;
+                    beepState = BEEP_QUIET;
+                    beepOff();
+                }
+            }
+            break;
+
+        case BEEP_QUIET:
+            if (!((long)(beepNextEventMs - millis()) > 0))
+            {
+                beepCount--;
+
+                if (beepCount == 0)
+                {
+                    // We should not be here, but just in case
+                    beepLengthMs = 0; // Stop state machine
+                    beepState = BEEP_OFF;
+                    beepOff();
+                }
+                else
+                {
+                    beepNextEventMs = millis() + beepLengthMs;
+                    beepState = BEEP_ON;
+                    beepOn();
+                }
+            }
+            break;
+        }
+    }
+}
+
+// Monitor momentary buttons
+void buttonCheckTask(void *e)
+{
+    // Record the time of the most recent two button releases
+    // This allows us to detect single and double presses
+
+    // User must press and release twice within this to create a double tap
+    // 250ms is OK for youngsters. 500ms is better for older fingers
+    // Remember that this also limits how fast you can scroll through the display menu
+    // Set settings.defaultDoubleTapInterval_ms to the minimum for your fingers
+    unsigned long doubleTapInterval = settings.defaultDoubleTapInterval_ms;
+
+    if ((productVariant == RTK_TORCH) || (productVariant == RTK_TORCH_X2))
+        doubleTapInterval = 1000; // We are only interested in double taps, so use a longer interval
+
+    unsigned long previousButtonRelease = 0;
+    unsigned long thisButtonRelease = 0;
+    bool singleTap = false;
+    bool doubleTap = false;
+
+    // Start notification
+    task.buttonCheckTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintln("Task buttonCheckTask started");
+
+    // Run task until a request is raised
+    task.buttonCheckTaskStopRequest = false;
+    while (task.buttonCheckTaskStopRequest == false)
+    {
+        // Display an alive message
+        if (PERIODIC_DISPLAY(PD_TASK_BUTTON_CHECK) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_TASK_BUTTON_CHECK);
+            systemPrintln("ButtonCheckTask running");
+        }
+
+        buttonRead();
+
+        // Begin button checking
+
+        if (buttonReleased() == true) // If a button release is detected, record it
+        {
+            previousButtonRelease = thisButtonRelease;
+            thisButtonRelease = millis();
+        }
+
+        // Do we have a double tap?
+        if ((previousButtonRelease > 0) && (thisButtonRelease > 0) &&
+            ((thisButtonRelease - previousButtonRelease) <= doubleTapInterval))
+        {
+            doubleTap = true;
+            singleTap = false;
+            previousButtonRelease = 0;
+            thisButtonRelease = 0;
+        }
+
+        // Do we have a single tap?
+        else if ((thisButtonRelease > 0) && ((millis() - thisButtonRelease) > doubleTapInterval))
+        {
+            doubleTap = false;
+            singleTap = true;
+            previousButtonRelease = 0;
+            thisButtonRelease = 0;
+        }
+
+        // else // if ((previousButtonRelease == 0) && (thisButtonRelease > 0)) // Tap in progress?
+        else if ((millis() - previousButtonRelease) > 2000) // No user interaction
+        {
+            doubleTap = false;
+            singleTap = false;
+        }
+
+        // If a display is present, throw away the first button press to avoid re-entering setup?
+        // Seems unnecessary... Commenting it for now... TODO: revisit this
+        // if (singleTap || doubleTap)
+        // {
+        //     if (firstButtonThrownOut == false && present.display_type != DISPLAY_MAX_NONE)
+        //     {
+        //         firstButtonThrownOut = true;
+        //         doubleTap = false;
+        //         singleTap = false;
+        //     }
+        // }
+
+        // If user presses the center button or right, act as double tap (select)
+        if (singleTap && online.gpioExpanderButtons)
+        {
+            if (buttonLastPressed() == gpioExpander_center || buttonLastPressed() == gpioExpander_right)
+            {
+                doubleTap = true;
+                singleTap = false;
+                previousButtonRelease = 0;
+                thisButtonRelease = 0;
+
+                gpioExpander_lastReleased = 255; // Reset for the next read
+            }
+        }
+        // If user presses the power button (on a dual button system) act as double tap (select)
+        if (singleTap && online.functionButton && online.powerButton)
+        {
+            if (buttonLastPressed() == dualButton_power)
+            {
+                // If we are displaying the menu, treat power button press as a double tap (select)
+                if (systemState == STATE_DISPLAY_SETUP)
+                {
+                    doubleTap = true;
+                    singleTap = false;
+                }
+                else
+                {
+                    // If we are not displaying the menu, treat power button press as a single tap (open the menu)
+                    doubleTap = false;
+                    singleTap = true;
+                }
+                previousButtonRelease = 0;
+                thisButtonRelease = 0;
+
+                dualButton_lastReleased = 255; // Reset for the next read
+            }
+        }
+
+        // End button checking
+
+        // If in direct connect mode. Note: this is just a flag not a STATE.
+        if (inDirectConnectMode)
+        {
+            // TODO: confirm this works on all platforms
+            if (singleTap || doubleTap)
+            {
+                // Beep to indicate exit
+                beepOn();
+                delay(300);
+                beepOff();
+                delay(100);
+                beepOn();
+                delay(300);
+                beepOff();
+
+                systemPrintln("Exiting direct connection (passthrough) mode");
+                systemFlush(); // Complete prints
+
+                // See #763 . Do the file removal in the loop
+                task.endDirectConnectMode = true; // Indicate to loop that direct connection should be ended
+
+                doubleTap = false; // Clean up
+                singleTap = false;
+            }
+        }
+
+        // If we are in tilt mode, buttons do only one thing: exit on button press
+        else if (tiltIsCorrecting() == true)
+        {
+            if (singleTap || doubleTap)
+            {
+                tiltRequestStop(); // Don't force the hardware off here as it may be in use in another task
+
+                doubleTap = false; // Clean up
+                singleTap = false;
+            }
+        }
+
+        // Products with no display are a special case. Handle web config mode entry/exit.
+        else if (present.display_type == DISPLAY_MAX_NONE)
+        {
+            if (productVariant == RTK_TORCH || productVariant == RTK_TORCH_X2)
+            {
+                // Platform has no display and possibly tilt corrections, ie RTK Torch and RTK Torch X2
+
+                // Print how long the button has been held. Useful for setting the powerButtonPressLimit
+                // static uint16_t longestPress = 0;
+                // // Torch shuts down when powerButtonPressedFor reaches ~2400
+                // //const uint16_t pressDurations[] = { 1900, 1950, 2000, 2050, 2100, 2150, 2200, 2250, 2300, 2350,
+                // 2400, 2450, 2500 };
+                // // Torch X2 shuts down when powerButtonPressedFor reaches ~1500
+                // const uint16_t pressDurations[] = { 1000, 1050, 1100, 1150, 1200, 1250, 1300, 1350, 1400, 1450, 1500,
+                // 1650, 1700 }; const uint16_t numDurations = sizeof(pressDurations) / sizeof(uint16_t); for (uint16_t
+                // d = longestPress; d < numDurations; d++)
+                // {
+                //     if (powerButtonPressedFor(pressDurations[d]))
+                //     {
+                //         systemPrintf("Torch power button pressed for %dms\r\n", pressDurations[d]);
+                //         longestPress = d + 1;
+                //     }
+                // }
+
+                // Torch X2 shuts down when powerButtonPressedFor reaches ~1500
+                // To allow time for the beep, we need to start shutting down at ~1200
+                uint16_t powerButtonPressLimit = 1200;
+                if (productVariant == RTK_TORCH)
+                    powerButtonPressLimit = 2100; // For Torch, it is closer to ~2400
+
+                if (doubleTap)
+                {
+                    // If we are in Rover/Base mode, enter WiFi Config Mode
+                    if (inRoverMode() || inBaseMode())
+                    {
+                        // Beep if we are not locally compiled or a release candidate
+                        if (ENABLE_DEVELOPER == false)
+                        {
+                            beepOn();
+                            delay(300);
+                            beepOff();
+                            delay(100);
+                            beepOn();
+                            delay(300);
+                            beepOff();
+                        }
+
+                        forceMenuExit = true;          // Force menu exit to go immediately into web config
+                        forceSystemStateUpdate = true; // Immediately go to this new state
+                        changeState(STATE_WEB_CONFIG_NOT_STARTED);
+                    }
+
+                    // If we are in WiFi Config Mode, exit to Rover
+                    else if (inWebConfigMode())
+                    {
+                        // Beep if we are not locally compiled or a release candidate
+                        if (ENABLE_DEVELOPER == false)
+                        {
+                            beepOn();
+                            delay(300);
+                            beepOff();
+                            delay(100);
+                            beepOn();
+                            delay(300);
+                            beepOff();
+                        }
+
+                        // Force menu exit to go immediately into Rover
+                        // (User can open the menu while in web config)
+                        forceMenuExit = true;
+
+                        forceSystemStateUpdate = true; // Immediately go to this new state
+                        changeState(settings.lastState);
+                    }
+
+                    doubleTap = false; // Clean up
+                }
+
+                // The RTK Torch uses a shutdown IC configured to turn off ~3s
+                // Beep shortly before the shutdown IC takes over
+                else if (powerButtonPressedFor(powerButtonPressLimit) == true)
+                {
+                    systemPrintln("Shutting down (button)");
+                    systemFlush();
+
+                    tickerStop(); // Stop controlling LEDs via ticker task
+
+                    pinMode(pin_gnssStatusLED, OUTPUT);
+                    pinMode(pin_bluetoothStatusLED, OUTPUT);
+
+                    gnssStatusLedOn();
+                    bluetoothLedOn();
+
+                    // Beep if we are not locally compiled or a release candidate
+                    if (ENABLE_DEVELOPER == false)
+                    {
+                        // Announce powering down
+                        beepMultiple(3, 100, 50); // Number of beeps, length of beep ms, length of quiet ms
+
+                        delay(500); // We will be shutting off during this delay but this prevents another
+                                    // beepMultiple() from firing
+                    }
+
+                    // If we have fast power off, use it
+                    if (present.fastPowerOff == true)
+                        powerDown(false); // Don't display info
+
+                    while (1)
+                        ;
+                }
+            } // End productVariant == Torch/Torch X2
+        } // End present.display_type == DISPLAY_MAX_NONE
+        else // Display is present: RTK EVK, RTK Facet mosaic, RTK Postcard, Facet FP
+        {
+            if (systemState == STATE_SHUTDOWN)
+            {
+                // Ignore button presses while shutting down
+                doubleTap = false; // Clean up
+                singleTap = false;
+            }
+            // Has the button been held long enough for shutdown?
+            else if (powerButtonPressedFor(shutDownButtonTime))
+            {
+                forceSystemStateUpdate = true;
+                requestChangeState(STATE_SHUTDOWN);
+
+                systemPrintln("Shutting down (button)");
+                systemFlush();
+
+                if (productVariant == RTK_FACET_FP)
+                {
+                    tickerStop(); // Stop controlling LEDs via ticker task
+
+                    pinMode(pin_gnssStatusLED, OUTPUT);
+                    pinMode(pin_bluetoothStatusLED, OUTPUT);
+
+                    gnssStatusLedOn();
+                    bluetoothLedOn();
+
+                    // Beep if we are not locally compiled or a release candidate
+                    if (ENABLE_DEVELOPER == false)
+                    {
+                        // Announce powering down
+                        beepMultiple(3, 100, 50); // Number of beeps, length of beep ms, length of quiet ms
+                    }
+                }
+
+                if (inMainMenu)
+                {
+                    powerDown(true); // State machine is not updated while in menu system so go straight to power down
+                                     // as needed
+                }
+
+                doubleTap = false; // Clean up
+                singleTap = false;
+            }
+            // If the button is disabled, do nothing
+            else if (settings.disableSetupButton == true)
+            {
+                doubleTap = false; // Clean up
+                singleTap = false;
+            }
+
+            // If the setup menu is being displayed and we detect a singleTap, move through menus
+            else if ((systemState == STATE_DISPLAY_SETUP) && singleTap)
+            {
+                // If we are displaying the setup menu, a single tap will cycle through possible system states
+                // Exit into new system state on double tap - see below
+                // Exit display setup into previous state after ~10s - see updateSystemState()
+                lastSetupMenuChange.setTimerToMillis();
+
+                forceDisplayUpdate = true; // User is interacting so repaint display quickly
+
+                if (online.gpioExpanderButtons == true)
+                {
+                    // React to five different buttons
+                    if (buttonLastPressed() == gpioExpander_up || buttonLastPressed() == gpioExpander_left)
+                    {
+                        if (setupSelectedButton == 0) // Top reached?
+                            setupSelectedButton = setupButtons.size() - 1;
+                        else
+                            setupSelectedButton--;
+                    }
+                    else if (buttonLastPressed() == gpioExpander_down)
+                    {
+                        setupSelectedButton++;
+                        if (setupSelectedButton == setupButtons.size()) // Limit reached?
+                            setupSelectedButton = 0;
+                    }
+                }
+                else
+                {
+                    // React to single mode/setup button
+                    setupSelectedButton++;
+                    if (setupSelectedButton == setupButtons.size()) // Limit reached?
+                        setupSelectedButton = 0;
+                }
+
+                doubleTap = false; // Clean up
+                singleTap = false;
+            } // End STATE_DISPLAY_SETUP singleTap
+            // If the setup menu is being displayed and we detect a doubleTap, change mode and exit
+            else if ((systemState == STATE_DISPLAY_SETUP) && doubleTap)
+            {
+                lastSetupMenuChange.setTimerToMillis(); // Prevent a timeout during state change
+                uint8_t thisIsButton = 0;
+                for (auto it = setupButtons.begin(); it != setupButtons.end(); it = std::next(it))
+                {
+                    if (thisIsButton == setupSelectedButton)
+                    {
+                        if (it->newState == STATE_PROFILE)
+                        {
+                            displayProfile = it->newProfile; // paintProfile needs the unit
+                            requestChangeState(STATE_PROFILE);
+                        }
+                        else if (it->newState == STATE_NOT_SET) // Exit
+                        {
+                            firstButtonThrownOut = false;
+                            requestChangeState(lastSystemState);
+                        }
+                        else if (it->newState == STATE_BASE_NOT_STARTED) // User selected Base, clear BaseCast override
+                        {
+                            baseCasterDisableOverride();
+                            requestChangeState(it->newState);
+                        }
+                        else
+                            requestChangeState(it->newState);
+
+                        break;
+                    }
+                    thisIsButton++;
+                }
+
+                doubleTap = false; // Clean up
+                singleTap = false;
+            } // End STATE_DISPLAY_SETUP doubleTap
+            // If the button was pressed to show the menu, then show the menu
+            else if (singleTap)
+            {
+                switch (systemState)
+                {
+                // If we are in any running state, change to STATE_DISPLAY_SETUP
+                case STATE_ROVER_NOT_STARTED:
+                case STATE_ROVER_CONFIG_WAIT:
+                case STATE_ROVER_NO_FIX:
+                case STATE_ROVER_FIX:
+                case STATE_ROVER_RTK_FLOAT:
+                case STATE_ROVER_RTK_FIX:
+                case STATE_BASE_CASTER_NOT_STARTED:
+                case STATE_BASE_ASSIST_NOT_STARTED:
+                case STATE_BASE_NOT_STARTED:
+                case STATE_BASE_CONFIG_WAIT:
+                case STATE_BASE_TEMP_SETTLE:
+                case STATE_BASE_TEMP_SURVEY_STARTED:
+                case STATE_BASE_TEMP_TRANSMITTING:
+                case STATE_BASE_FIXED_NOT_STARTED:
+                case STATE_BASE_FIXED_TRANSMITTING:
+                case STATE_WEB_CONFIG_NOT_STARTED:
+                case STATE_WEB_CONFIG:
+                case STATE_ESPNOW_PAIRING_NOT_STARTED:
+                case STATE_ESPNOW_PAIRING:
+                case STATE_NTPSERVER_NOT_STARTED:
+                case STATE_NTPSERVER_NO_SYNC:
+                case STATE_NTPSERVER_SYNC:
+                    lastSystemState = systemState; // Remember this state to return if needed
+                    requestChangeState(STATE_DISPLAY_SETUP);
+                    lastSetupMenuChange.setTimerToMillis();
+                    setupSelectedButton = 0; // Highlight the first button
+                    break;
+
+                case STATE_PROFILE:
+                    // If the user presses the setup button during a profile change, do nothing
+                    // Allow system to return to lastSystemState
+                    break;
+
+                default:
+                    systemPrintf("buttonCheckTask single tap - untrapped system state: %s (%d)\r\n",
+                                 getState(systemState), systemState);
+                    // requestChangeState(STATE_BASE_NOT_STARTED);
+                    break;
+                } // End singleTap switch (systemState)
+
+                doubleTap = false; // Clean up
+                singleTap = false;
+            } // End singleTap
+        } // End Display is present: RTK EVK, RTK Facet mosaic, RTK Postcard, RTK Facet FP
+
+        feedWdt();
+        taskYIELD();
+    } // End while (task.buttonCheckTaskStopRequest == false)
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintln("Task buttonCheckTask stopped");
+    task.buttonCheckTaskRunning = false;
+    vTaskDelete(buttonTaskHandle);
+}
+
+void idleTask(void *e)
+{
+    int cpu = xPortGetCoreID();
+    volatile bool *idleTaskRunning;
+    uint32_t idleCount = 0;
+    uint32_t lastDisplayIdleTime = 0;
+    uint32_t lastStackPrintTime = 0;
+
+    // Start notification
+    idleTaskRunning = cpu ? &task.idleTask1Running : &task.idleTask0Running;
+    *idleTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintf("Task idleTask%d started\r\n", cpu);
+
+    // Verify that the task is still running
+    while (*idleTaskRunning)
+    {
+        // Increment a count during the idle time
+        idleCount++;
+
+        // Determine if it is time to print the CPU idle times
+        if ((millis() - lastDisplayIdleTime) >= (IDLE_TIME_DISPLAY_SECONDS * 1000) && !inMainMenu)
+        {
+            lastDisplayIdleTime = millis();
+
+            // Get the idle time
+            if (idleCount > max_idle_count)
+                max_idle_count = idleCount;
+
+            // Display the idle times
+            if (settings.enablePrintIdleTime)
+            {
+                systemPrintf("CPU %d idle time: %d%% (%d/%d)\r\n", cpu, idleCount * 100 / max_idle_count, idleCount,
+                             max_idle_count);
+
+                // Print the task count
+                if (cpu)
+                    systemPrintf("%d Tasks\r\n", uxTaskGetNumberOfTasks());
+            }
+
+            // Restart the idle count for the next display time
+            idleCount = 0;
+        }
+
+        // Display the high water mark if requested
+        if ((settings.enableTaskReports == true) &&
+            ((millis() - lastStackPrintTime) >= (IDLE_TIME_DISPLAY_SECONDS * 1000)))
+        {
+            lastStackPrintTime = millis();
+            systemPrintf("idleTask %d High watermark: %d\r\n", xPortGetCoreID(), uxTaskGetStackHighWaterMark(nullptr));
+        }
+
+        // The idle task should NOT delay or yield
+    }
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintf("Task idleTask%d stopped\r\n", cpu);
+    *idleTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+// Serial Read/Write tasks for the GNSS receiver must be started after BT is up and running otherwise
+// SerialBT->available will cause reboot
+bool tasksStartGnssUart()
+{
+    TaskHandle_t taskHandle;
+
+    if (present.gnss_to_uart == false)
+        return (true);
+
+    // Verify that the ring buffer was successfully allocated
+    if (!ringBuffer)
+    {
+        systemPrintln("ERROR: Ring buffer allocation failure!");
+        systemPrintln("Decrease GNSS handler (ring) buffer size");
+        displayNoRingBuffer(5000);
+        return false;
+    }
+
+    availableHandlerSpace = settings.gnssHandlerBufferSize;
+
+    // Reads data from GNSS and stores data into circular buffer
+    if (!task.gnssReadTaskRunning)
+    {
+        if (xTaskCreatePinnedToCore(gnssReadTask,                  // Function to call
+                                    "gnssRead",                    // Just for humans
+                                    gnssReadTaskStackSize,         // Stack Size
+                                    nullptr,                       // Task input parameter
+                                    settings.gnssReadTaskPriority, // Priority
+                                    &taskHandle,                   // Task handle
+                                    settings.gnssReadTaskCore) != pdPASS) // Core where task should run
+            systemPrintln("ERROR: Failed to create gnssRead task");
+    }
+
+    // Reads data from circular buffer and sends data to SD, SPP, or network clients
+    if (!task.handleGnssDataTaskRunning)
+    {
+        if (xTaskCreatePinnedToCore(handleGnssDataTask,                  // Function to call
+                                    "handleGNSSData",                    // Just for humans
+                                    handleGnssDataTaskStackSize,         // Stack Size
+                                    nullptr,                             // Task input parameter
+                                    settings.handleGnssDataTaskPriority, // Priority
+                                    &taskHandle,                         // Task handle
+                                    settings.handleGnssDataTaskCore) != pdPASS) // Core where task should run
+            systemPrintln("ERROR: Failed to create handleGNSSData task");
+    }
+
+    // Reads data from BT and sends to GNSS
+    if (!task.btReadTaskRunning)
+    {
+        if (xTaskCreatePinnedToCore(btReadTask,                  // Function to call
+                                    "btRead",                    // Just for humans
+                                    btReadTaskStackSize,         // Stack Size
+                                    nullptr,                     // Task input parameter
+                                    settings.btReadTaskPriority, // Priority
+                                    &taskHandle,                 // Task handle
+                                    settings.btReadTaskCore) != pdPASS) // Core where task should run
+            systemPrintln("ERROR: Failed to create btRead task");
+    }
+    return true;
+}
+
+// Stop tasks - useful when running firmware update or WiFi AP is running
+void tasksStopGnssUart()
+{
+    // Stop tasks if running
+    task.gnssReadTaskStopRequest = true;
+    task.handleGnssDataTaskStopRequest = true;
+    task.btReadTaskStopRequest = true;
+
+    // Give the other CPU time to finish
+    // Eliminates CPU bus hang condition
+    do
+        delay(10);
+    while (task.gnssReadTaskRunning || task.handleGnssDataTaskRunning || task.btReadTaskRunning);
+}
+
+// Checking the number of available clusters on the SD card can take multiple seconds
+// Rather than blocking the system, we run a background task
+// Once the size check is complete, the task is removed
+void sdSizeCheckTask(void *e)
+{
+    // Start notification
+    task.sdSizeCheckTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintln("Task sdSizeCheckTask started");
+
+    // Run task until a request is raised
+    task.sdSizeCheckTaskStopRequest = false;
+    while (task.sdSizeCheckTaskStopRequest == false)
+    {
+        // Display an alive message
+        if (PERIODIC_DISPLAY(PD_TASK_SD_SIZE_CHECK) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_TASK_SD_SIZE_CHECK);
+            systemPrintln("sdSizeCheckTask running");
+        }
+
+        if (online.microSD && sdCardSize == 0)
+        {
+            // Attempt to gain access to the SD card
+            if (xSemaphoreTake(sdCardSemaphore, fatSemaphore_longWait_ms) == pdPASS)
+            {
+                markSemaphore(FUNCTION_SDSIZECHECK);
+
+                csd_t csd;
+                sd->card()->readCSD(&csd); // Card Specific Data
+                sdCardSize = (uint64_t)512 * sd->card()->sectorCount();
+
+                sd->volumeBegin();
+
+                // Find available cluster/space
+                sdFreeSpace = sd->vol()->freeClusterCount(); // This takes a few seconds to complete
+                sdFreeSpace *= sd->vol()->sectorsPerCluster();
+                sdFreeSpace *= 512L; // Bytes per sector
+
+                xSemaphoreGive(sdCardSemaphore);
+
+                // uint64_t sdUsedSpace = sdCardSize - sdFreeSpace; //Don't think of it as used, think of it as unusable
+
+                String cardSize;
+                stringHumanReadableSize(cardSize, sdCardSize);
+                String freeSpace;
+                stringHumanReadableSize(freeSpace, sdFreeSpace);
+                systemPrintf("SD card size: %s / Free space: %s\r\n", cardSize, freeSpace);
+
+                outOfSDSpace = false;
+
+                task.sdSizeCheckTaskStopRequest = true; // We're done, stop the task.
+            }
+            else
+            {
+                char semaphoreHolder[50];
+                getSemaphoreFunction(semaphoreHolder);
+                log_d("sdCardSemaphore failed to yield, held by %s, Tasks.ino line %d\r\n", semaphoreHolder, __LINE__);
+            }
+        }
+
+        feedWdt();
+        taskYIELD(); // Let other tasks run
+    }
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintln("Task sdSizeCheckTask stopped");
+    task.sdSizeCheckTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+// Validate the task table lengths
+void tasksValidateTables()
+{
+    if (ringBufferConsumerEntries != RBC_MAX)
+        reportFatalError("Fix ringBufferConsumer table to match RingBufferConsumers");
+}
+
+// Monitor the 2nd BleSerial port (bluetoothSerialBleCommands) for incoming serial
+// Read incoming serial until \r\n is received, then pass to command processor
+void bluetoothCommandTask(void *pvParameters)
+{
+    int rxSpot = 0;
+    char rxData[256]; // Input limit of 256 chars
+    bool passRtcmToGnss = false;
+    uint32_t rtcmTimer = 0;
+
+    // Start notification
+    task.bluetoothCommandTaskRunning = true;
+    if (settings.printTaskStartStop)
+        systemPrintln("Task bluetoothCommandTask started");
+
+    // Run task until a request is raised
+    task.bluetoothCommandTaskStopRequest = false;
+    while (task.bluetoothCommandTaskStopRequest == false)
+    {
+        // Display an alive message
+        if (PERIODIC_DISPLAY(PD_TASK_BLUETOOTH_READ) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_TASK_BLUETOOTH_READ);
+            systemPrintln("bluetoothCommandTask running");
+        }
+
+        // Don't process commands while the GNSS is being configured
+        if (!gnssConfigureInProgress)
+        {
+            // Check stream for incoming characters
+            if (bluetoothCommandAvailable() > 0)
+            {
+                byte incoming = bluetoothCommandRead();
+                bleCommandTrafficSeen_ms = millis();
+
+                // The app may send binary RTCM over the BLE command channel; keep it out of the CLI line parser.
+                if (incoming == 0xd3)
+                {
+                    passRtcmToGnss = true;
+                    rtcmTimer = millis();
+                    rxSpot = 0;
+                }
+
+                if (passRtcmToGnss && ((millis() - rtcmTimer) < RTCM_CORRECTION_INPUT_TIMEOUT))
+                {
+                    rtcmTimer = millis();
+                    rtcmLastPacketReceived = rtcmTimer;
+                    bluetoothIncomingRTCM = true;
+
+                    if (correctionLastSeen(CORR_BLUETOOTH))
+                        addToGnssBuffer(incoming);
+
+                    continue;
+                }
+
+                passRtcmToGnss = false;
+
+                rxData[rxSpot++] = incoming;
+                rxSpot %= sizeof(rxData); // Wrap
+
+                // Verify presence of trailing \r\n
+                if (rxSpot > 2 && rxData[rxSpot - 1] == '\n' && rxData[rxSpot - 2] == '\r')
+                {
+                    rxData[rxSpot - 2] = '\0'; // Remove \r\n
+                    processCommand(rxData);
+                    rxSpot = 0; // Reset
+                }
+            }
+        }
+
+        if (PERIODIC_DISPLAY(PD_BLUETOOTH_DATA_RX) && !inMainMenu)
+        {
+            PERIODIC_CLEAR(PD_BLUETOOTH_DATA_RX);
+            systemPrintf("bluetoothCommandTask: %d bytes waiting to be processed\r\n", rxSpot);
+        }
+
+        if ((settings.enableTaskReports == true) && (!inMainMenu))
+            systemPrintf("bluetoothCommandTask High watermark: %d\r\n", uxTaskGetStackHighWaterMark(nullptr));
+
+        feedWdt();
+        taskYIELD();
+    } // End while(true)
+
+    // Stop notification
+    if (settings.printTaskStartStop)
+        systemPrintln("Task bluetoothCommandTask stopped");
+    task.bluetoothCommandTaskRunning = false;
+    vTaskDelete(bluetoothCommandTaskHandle); // Stop the task
+    bluetoothCommandTaskHandle = nullptr;
+}
+
+void beginRtcmParse()
+{
+    // Begin the RTCM parser - which will extract the base location from RTCM1005 / 1006
+    size_t bufferLength = psramFound() ? 16384 : 1050;
+    uint8_t *buffer = (uint8_t *)rtkMalloc(bufferLength, "SEMP rtcmBuffer");
+    rtcmParse = sempBeginParser("rtcmParse", rtcmParserTable, rtcmParserCount, buffer, bufferLength,
+                                processRTCMMessage, // eom Call Back
+                                output);            // Routine to output an error character
+    if (!rtcmParse)
+        reportFatalError("Failed to initialize the RTCM parser");
+
+    if (settings.debugNtripClientRtcm)
+    {
+        sempDebugOutputEnable(rtcmParse, output);
+        sempPrintParserConfiguration(rtcmParse, output);
+    }
+}
+
+// Check and record the base location in RTCM1005/1006
+void processRTCMMessage(SEMP_PARSE_STATE *parse, uint16_t type)
+{
+    if (sempRtcmGetMessageNumber(parse) == 1005)
+    {
+        ARPECEFX = sempRtcmGetSignedBits(parse, 34, 38);
+        ARPECEFY = sempRtcmGetSignedBits(parse, 74, 38);
+        ARPECEFZ = sempRtcmGetSignedBits(parse, 114, 38);
+        ARPECEFH = 0;
+        newARPAvailable = true;
+    }
+
+    if (sempRtcmGetMessageNumber(parse) == 1006)
+    {
+        ARPECEFX = sempRtcmGetSignedBits(parse, 34, 38);
+        ARPECEFY = sempRtcmGetSignedBits(parse, 74, 38);
+        ARPECEFZ = sempRtcmGetSignedBits(parse, 114, 38);
+        ARPECEFH = sempRtcmGetUnsignedBits(parse, 152, 16);
+        newARPAvailable = true;
+    }
+}
